@@ -1,0 +1,548 @@
+import os
+import json
+import re
+import random
+import string
+from datetime import datetime, date
+from functools import wraps
+
+from flask import (Flask, request, Response,
+                   render_template_string, redirect, session)
+from twilio.rest import Client as TwilioClient
+import anthropic
+from supabase import create_client
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'basil-fox-secret-changeme')
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+TWILIO_ACCOUNT_SID = os.environ['TWILIO_ACCOUNT_SID']
+TWILIO_AUTH_TOKEN  = os.environ['TWILIO_AUTH_TOKEN']
+TWILIO_FROM        = 'whatsapp:+14155238886'   # Sandbox number
+ANTHROPIC_API_KEY  = os.environ['ANTHROPIC_API_KEY']
+SUPABASE_URL       = os.environ['SUPABASE_URL']
+SUPABASE_KEY       = os.environ['SUPABASE_KEY']
+ADMIN_PASSWORD     = os.environ['ADMIN_PASSWORD']
+
+# ── Clients ───────────────────────────────────────────────────────────────────
+
+twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+db     = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ── Database helpers ──────────────────────────────────────────────────────────
+
+def get_user(phone):
+    r = db.table('users').select('*').eq('phone_number', phone).execute()
+    return r.data[0] if r.data else None
+
+def register_user(phone, code):
+    db.table('users').insert({
+        'phone_number':  phone,
+        'invite_code':   code,
+        'registered_at': datetime.utcnow().isoformat(),
+        'blocked':       False
+    }).execute()
+
+def get_invite_code(code):
+    r = db.table('invite_codes').select('*').eq('code', code).execute()
+    return r.data[0] if r.data else None
+
+def increment_invite_code(code):
+    row = db.table('invite_codes').select('uses_count').eq('code', code).execute().data[0]
+    db.table('invite_codes').update(
+        {'uses_count': row['uses_count'] + 1}
+    ).eq('code', code).execute()
+
+def log_query(phone, query, response):
+    db.table('queries').insert({
+        'phone_number': phone,
+        'query':        query,
+        'response':     response,
+        'queried_at':   datetime.utcnow().isoformat()
+    }).execute()
+
+# ── Claude prompts ────────────────────────────────────────────────────────────
+
+TEAM_PROMPT = """\
+You are Basil — a sharp, witty fox who helps UK sports fans find their team on TV.
+
+Today is {today}.
+
+The user has sent: "{query}"
+
+Your tasks:
+1. Work out if this is a football or rugby union team (use common sense — Leinster is rugby, Arsenal is football).
+2. Search wheresthematch.com to find whether they are playing TODAY.
+3. If playing today: get the UK TV channel, kick-off time, coverage start time, and current odds \
+from a UK bookmaker (Paddy Power, Bet365, Sky Bet or William Hill).
+4. If NOT playing today: find their very next fixture — date, TV channel, kick-off time.
+5. Write a fox fact. Rules: genuinely surprising or funny, based on real fox behaviour, \
+under 60 words, ends with a one-liner that connects fox instinct to the idea of having a wager on this match.
+
+Return ONLY valid JSON — no markdown, no explanation, no backticks, nothing else.
+
+If playing TODAY use exactly this structure:
+{{"playing_today":true,"sport":"football","home_team":"","away_team":"","competition":"","venue":"","kickoff":"","coverage_start":"","tv_channel":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}
+
+If NOT playing today use exactly this structure:
+{{"playing_today":false,"sport":"football","home_team":"","away_team":"","competition":"","venue":"","next_date":"","kickoff":"","tv_channel":"","fox_fact":""}}"""
+
+SPORT_PROMPT = """\
+You are Basil — a sharp, witty fox who helps UK sports fans find what's on TV.
+
+Today is {today}.
+
+The user wants to know what {sport} matches are on UK TV TODAY.
+
+Search wheresthematch.com for today's {sport} TV listings. Pick the 4-5 most notable matches.
+
+Write a fox fact under 50 words that ends with a witty nudge toward having a flutter on today's action.
+
+Return ONLY valid JSON — no markdown, no explanation, no backticks, nothing else:
+
+{{"sport":"{sport}","matches":[{{"home_team":"","away_team":"","competition":"","kickoff":"","tv_channel":""}}],"fox_fact":"","bookmaker":"Sky Bet","bookmaker_url":"https://www.skybet.com"}}"""
+
+# ── Claude caller ─────────────────────────────────────────────────────────────
+
+def call_claude(prompt):
+    response = claude.messages.create(
+        model='claude-sonnet-4-20250514',
+        max_tokens=1000,
+        messages=[{'role': 'user', 'content': prompt}],
+        tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
+    )
+    text = ''.join(b.text for b in response.content if getattr(b, 'type', '') == 'text')
+    text = re.sub(r'^```(?:json)?\s*', '', text.strip())
+    text = re.sub(r'\s*```$', '', text)
+    return json.loads(text.strip())
+
+def basil_team(query):
+    today  = datetime.now().strftime('%A %d %B %Y')
+    prompt = TEAM_PROMPT.format(today=today, query=query)
+    return call_claude(prompt)
+
+def basil_sport(sport):
+    today  = datetime.now().strftime('%A %d %B %Y')
+    prompt = SPORT_PROMPT.format(today=today, sport=sport)
+    return call_claude(prompt)
+
+# ── Message formatters ────────────────────────────────────────────────────────
+
+def fmt_team(d):
+    e = '🏉' if d.get('sport') == 'rugby' else '⚽'
+
+    if d.get('playing_today'):
+        lines = [
+            "🦊 *Basil's tip for today...*\n",
+            f"{e} *{d['home_team']} vs {d['away_team']}*",
+            f"{d['competition']} | {d['venue']}\n",
+            f"📺 *{d['tv_channel']}*",
+        ]
+        if d.get('coverage_start'):
+            lines.append(f"Coverage {d['coverage_start']} | KO {d['kickoff']}")
+        else:
+            lines.append(f"KO {d['kickoff']}")
+        lines += [
+            '',
+            f"💰 *Odds ({d['bookmaker']})*",
+            f"{d['home_team']}: {d['home_odds']} | "
+            f"Draw: {d['draw_odds']} | "
+            f"{d['away_team']}: {d['away_odds']}\n",
+            "🦊 *Basil says:*",
+            d['fox_fact'],
+            '',
+            "📲 *Want a flutter?*",
+            d['bookmaker_url'],
+        ]
+    else:
+        lines = [
+            f"🦊 *{d['home_team']} aren't on TV today.*\n",
+            f"Next up: *{d['home_team']} vs {d['away_team']}*",
+            f"{d['competition']} | {d['venue']}",
+            f"📺 {d['tv_channel']} — {d['next_date']}, KO {d['kickoff']}\n",
+            "🦊 *Basil says:*",
+            d['fox_fact'],
+        ]
+
+    return '\n'.join(lines)
+
+def fmt_sport(d):
+    e = '🏉' if d.get('sport') == 'rugby' else '⚽'
+    lines = ["🦊 *Basil's picks for today...*\n"]
+    for m in d.get('matches', []):
+        lines.append(f"{e} *{m['home_team']} vs {m['away_team']}*")
+        lines.append(f"{m['competition']} — {m['tv_channel']}, KO {m['kickoff']}\n")
+    lines += [
+        "🦊 *Basil says:*",
+        d['fox_fact'],
+        '',
+        "📲 *Have a flutter:*",
+        d['bookmaker_url'],
+    ]
+    return '\n'.join(lines)
+
+# ── Webhook ───────────────────────────────────────────────────────────────────
+
+def send(to, body):
+    twilio.messages.create(from_=TWILIO_FROM, to=to, body=body)
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    from_wa = request.form.get('From', '')
+    body    = request.form.get('Body', '').strip()
+    phone   = from_wa.replace('whatsapp:', '')
+    user    = get_user(phone)
+
+    # ── JOIN flow ─────────────────────────────────────────────────────────────
+    if body.upper().startswith('JOIN'):
+        parts = body.split(None, 1)
+        code  = parts[1].upper().strip() if len(parts) > 1 else ''
+
+        if user:
+            send(from_wa, "🦊 You're already registered! Just send me a team name.")
+        elif not code:
+            send(from_wa, "🦊 Send *JOIN yourcode* to get started.")
+        else:
+            invite = get_invite_code(code)
+            if not invite:
+                send(from_wa, "🦊 That code doesn't look right. Double-check with whoever invited you.")
+            elif invite['uses_count'] >= invite['max_uses']:
+                send(from_wa, "🦊 That invite code has run out. Ask for a fresh one.")
+            else:
+                register_user(phone, code)
+                increment_invite_code(code)
+                send(from_wa,
+                     "🦊 *Welcome to Basil!*\n\n"
+                     "Send me any team name and I'll tell you what channel they're on, "
+                     "the latest odds, and a little something to think about.\n\n"
+                     "Go on then — try a team name.")
+        return Response('', 204)
+
+    # ── Not registered ────────────────────────────────────────────────────────
+    if not user:
+        send(from_wa, "🦊 You'll need an invite code to use Basil.\nSend *JOIN yourcode* to get started.")
+        return Response('', 204)
+
+    # ── Blocked ───────────────────────────────────────────────────────────────
+    if user.get('blocked'):
+        return Response('', 204)
+
+    # ── Process query ─────────────────────────────────────────────────────────
+    try:
+        q = body.lower().strip()
+        if q in ['football', 'soccer']:
+            data  = basil_sport('football')
+            reply = fmt_sport(data)
+        elif q == 'rugby':
+            data  = basil_sport('rugby')
+            reply = fmt_sport(data)
+        else:
+            data  = basil_team(body)
+            reply = fmt_team(data)
+    except Exception as ex:
+        print(f'ERROR processing "{body}": {ex}')
+        reply = ("🦊 Basil's nose is twitching — something went wrong. "
+                 "Try again in a moment.")
+
+    log_query(phone, body, reply)
+    send(from_wa, reply)
+    return Response('', 204)
+
+# ── Admin auth ────────────────────────────────────────────────────────────────
+
+def auth_required(f):
+    @wraps(f)
+    def wrapper(*a, **kw):
+        if not session.get('admin'):
+            return redirect('/admin/login')
+        return f(*a, **kw)
+    return wrapper
+
+@app.route('/admin/login', methods=['GET', 'POST'])
+def admin_login():
+    err = ''
+    if request.method == 'POST':
+        if request.form.get('password') == ADMIN_PASSWORD:
+            session['admin'] = True
+            return redirect('/admin')
+        err = 'Wrong password. Try again.'
+    return render_template_string(LOGIN_HTML, err=err)
+
+@app.route('/admin/logout')
+def admin_logout():
+    session.clear()
+    return redirect('/admin/login')
+
+# ── Admin dashboard ───────────────────────────────────────────────────────────
+
+@app.route('/admin')
+@auth_required
+def admin():
+    users   = db.table('users').select('*').order('registered_at', desc=True).execute().data
+    queries = db.table('queries').select('*').order('queried_at', desc=True).limit(100).execute().data
+    codes   = db.table('invite_codes').select('*').order('created_at', desc=True).execute().data
+    today_count = sum(1 for q in queries if q['queried_at'][:10] == date.today().isoformat())
+    return render_template_string(ADMIN_HTML,
+        users=users, queries=queries, codes=codes,
+        today_count=today_count,
+        total_users=len(users),
+        total_queries=len(queries)
+    )
+
+@app.route('/admin/block', methods=['POST'])
+@auth_required
+def block_user():
+    phone = request.form.get('phone')
+    db.table('users').update({'blocked': True}).eq('phone_number', phone).execute()
+    return redirect('/admin')
+
+@app.route('/admin/unblock', methods=['POST'])
+@auth_required
+def unblock_user():
+    phone = request.form.get('phone')
+    db.table('users').update({'blocked': False}).eq('phone_number', phone).execute()
+    return redirect('/admin')
+
+@app.route('/admin/generate', methods=['POST'])
+@auth_required
+def generate_code():
+    code     = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    max_uses = int(request.form.get('max_uses', 1))
+    note     = request.form.get('note', '')
+    db.table('invite_codes').insert({
+        'code':       code,
+        'max_uses':   max_uses,
+        'uses_count': 0,
+        'note':       note,
+        'created_at': datetime.utcnow().isoformat()
+    }).execute()
+    return redirect('/admin')
+
+@app.route('/admin/delete-code', methods=['POST'])
+@auth_required
+def delete_code():
+    code = request.form.get('code')
+    db.table('invite_codes').delete().eq('code', code).execute()
+    return redirect('/admin')
+
+# ── HTML templates ────────────────────────────────────────────────────────────
+
+LOGIN_HTML = '''<!doctype html>
+<html>
+<head>
+  <title>Basil Admin</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:system-ui,sans-serif;background:#f4f1eb;
+         display:flex;align-items:center;justify-content:center;min-height:100vh}
+    .card{background:white;padding:2.5rem;border-radius:14px;
+          box-shadow:0 4px 24px rgba(0,0,0,.1);width:100%;max-width:380px}
+    h1{font-size:2rem;margin-bottom:.2rem}
+    p{color:#888;margin-bottom:1.5rem;font-size:.9rem}
+    input{width:100%;padding:.75rem 1rem;border:1px solid #ddd;
+          border-radius:8px;font-size:1rem;margin-bottom:1rem}
+    button{width:100%;padding:.75rem;background:#d4720a;color:white;
+           border:none;border-radius:8px;font-size:1rem;cursor:pointer;font-weight:600}
+    button:hover{background:#b85e08}
+    .err{color:#c00;font-size:.85rem;margin-bottom:1rem}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🦊 Basil</h1>
+    <p>Admin console</p>
+    {% if err %}<div class="err">{{ err }}</div>{% endif %}
+    <form method="post">
+      <input type="password" name="password" placeholder="Password" autofocus>
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>'''
+
+ADMIN_HTML = '''<!doctype html>
+<html>
+<head>
+  <title>Basil Admin</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:system-ui,sans-serif;background:#f4f1eb;color:#222}
+    header{background:#d4720a;color:white;padding:1rem 2rem;
+           display:flex;justify-content:space-between;align-items:center}
+    header h1{font-size:1.4rem}
+    header a{color:white;text-decoration:none;font-size:.85rem;opacity:.8}
+    .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;padding:1.5rem 2rem}
+    .stat{background:white;border-radius:10px;padding:1.25rem;
+          box-shadow:0 2px 8px rgba(0,0,0,.07)}
+    .stat .num{font-size:2rem;font-weight:700;color:#d4720a}
+    .stat .lbl{font-size:.8rem;color:#888;margin-top:.2rem}
+    .tabs{display:flex;gap:.5rem;padding:0 2rem;border-bottom:2px solid #e0d9cf}
+    .tab{padding:.75rem 1.25rem;cursor:pointer;font-weight:600;color:#888;
+         border-bottom:3px solid transparent;margin-bottom:-2px;font-size:.9rem}
+    .tab.active{color:#d4720a;border-color:#d4720a}
+    .panel{display:none;padding:1.5rem 2rem}
+    .panel.active{display:block}
+    table{width:100%;border-collapse:collapse;background:white;
+          border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.07)}
+    th{background:#f9f6f1;padding:.75rem 1rem;text-align:left;
+       font-size:.75rem;color:#888;text-transform:uppercase;letter-spacing:.05em}
+    td{padding:.75rem 1rem;border-top:1px solid #f0ebe3;font-size:.875rem;vertical-align:top}
+    tr:hover td{background:#faf8f5}
+    .badge{display:inline-block;padding:.2rem .6rem;border-radius:20px;font-size:.75rem;font-weight:600}
+    .ok{background:#d1fae5;color:#065f46}
+    .blocked{background:#fee2e2;color:#991b1b}
+    .code-badge{background:#fef3c7;color:#92400e;font-family:monospace;font-size:.85rem}
+    .btn{padding:.35rem .8rem;border:none;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:600}
+    .btn-red{background:#fee2e2;color:#991b1b}
+    .btn-green{background:#d1fae5;color:#065f46}
+    .btn-grey{background:#f3f4f6;color:#555}
+    .card{background:white;border-radius:10px;padding:1.5rem;
+          box-shadow:0 2px 8px rgba(0,0,0,.07);max-width:480px;margin-bottom:1.5rem}
+    .card h3{margin-bottom:1rem;font-size:1rem}
+    .row{display:flex;gap:.75rem;margin-bottom:.75rem;align-items:center}
+    .row input,.row select{padding:.6rem .9rem;border:1px solid #ddd;border-radius:8px;
+                            font-size:.9rem;flex:1}
+    .btn-primary{background:#d4720a;color:white;padding:.6rem 1.25rem;border:none;
+                 border-radius:8px;cursor:pointer;font-weight:600;font-size:.9rem;white-space:nowrap}
+    .btn-primary:hover{background:#b85e08}
+    .trunc{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .muted{color:#aaa;font-size:.8rem}
+    .two-col{display:grid;grid-template-columns:1fr 2fr;gap:1.5rem;align-items:start}
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🦊 Basil Admin</h1>
+  <a href="/admin/logout">Sign out</a>
+</header>
+
+<div class="stats">
+  <div class="stat"><div class="num">{{ total_users }}</div><div class="lbl">Registered users</div></div>
+  <div class="stat"><div class="num">{{ today_count }}</div><div class="lbl">Queries today</div></div>
+  <div class="stat"><div class="num">{{ total_queries }}</div><div class="lbl">Total queries</div></div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="show('users',this)">Users ({{ total_users }})</div>
+  <div class="tab" onclick="show('queries',this)">Query log</div>
+  <div class="tab" onclick="show('codes',this)">Invite codes</div>
+</div>
+
+<!-- USERS -->
+<div id="users" class="panel active">
+  <table>
+    <thead><tr><th>Phone</th><th>Code used</th><th>Registered</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+    {% for u in users %}
+    <tr>
+      <td>{{ u.phone_number }}</td>
+      <td><span class="badge code-badge">{{ u.invite_code }}</span></td>
+      <td>{{ u.registered_at[:16].replace("T"," ") }}</td>
+      <td>
+        {% if u.blocked %}<span class="badge blocked">Blocked</span>
+        {% else %}<span class="badge ok">Active</span>{% endif %}
+      </td>
+      <td>
+        {% if u.blocked %}
+          <form method="post" action="/admin/unblock" style="display:inline">
+            <input type="hidden" name="phone" value="{{ u.phone_number }}">
+            <button class="btn btn-green">Unblock</button>
+          </form>
+        {% else %}
+          <form method="post" action="/admin/block" style="display:inline">
+            <input type="hidden" name="phone" value="{{ u.phone_number }}">
+            <button class="btn btn-red">Block</button>
+          </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" style="text-align:center;color:#aaa;padding:2rem">No users yet</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- QUERIES -->
+<div id="queries" class="panel">
+  <table>
+    <thead><tr><th>Time</th><th>Phone</th><th>Query</th><th>Response preview</th></tr></thead>
+    <tbody>
+    {% for q in queries %}
+    <tr>
+      <td style="white-space:nowrap">{{ q.queried_at[:16].replace("T"," ") }}</td>
+      <td>{{ q.phone_number }}</td>
+      <td class="trunc">{{ q.query }}</td>
+      <td class="trunc muted">{{ q.response }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4" style="text-align:center;color:#aaa;padding:2rem">No queries yet</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- CODES -->
+<div id="codes" class="panel">
+  <div class="two-col">
+    <div class="card">
+      <h3>Generate invite code</h3>
+      <form method="post" action="/admin/generate">
+        <div class="row">
+          <input name="note" placeholder="Who's this for? (optional)">
+        </div>
+        <div class="row">
+          <select name="max_uses">
+            <option value="1">1 use</option>
+            <option value="3">3 uses</option>
+            <option value="5">5 uses</option>
+            <option value="10">10 uses</option>
+            <option value="999">Unlimited</option>
+          </select>
+          <button type="submit" class="btn-primary">Generate</button>
+        </div>
+      </form>
+    </div>
+
+    <table>
+      <thead><tr><th>Code</th><th>Note</th><th>Uses</th><th></th></tr></thead>
+      <tbody>
+      {% for c in codes %}
+      <tr>
+        <td><span class="badge code-badge">{{ c.code }}</span></td>
+        <td>{{ c.note or "—" }}</td>
+        <td>{{ c.uses_count }} / {{ c.max_uses }}</td>
+        <td>
+          <form method="post" action="/admin/delete-code" style="display:inline">
+            <input type="hidden" name="code" value="{{ c.code }}">
+            <button class="btn btn-grey">Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4" style="text-align:center;color:#aaa;padding:2rem">No codes yet</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function show(id, tab) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  tab.classList.add('active');
+}
+</script>
+</body>
+</html>'''
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
