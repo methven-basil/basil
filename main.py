@@ -123,9 +123,9 @@ def call_claude(prompt):
         btext = getattr(block, 'text', '')[:300] if hasattr(block, 'text') else ''
         print(f"  Block {i}: type={btype} | text={btext}")
 
-    # Extract all text blocks
-    text = ''.join(b.text for b in response.content if getattr(b, 'type', '') == 'text')
-    print(f"Extracted text: '{text[:400]}'")
+    # Extract all text blocks (guard against None text values)
+    text = ''.join((b.text or '') for b in response.content if getattr(b, 'type', '') == 'text')
+    print(f"Extracted text (full): '{text}'")
 
     # Clean markdown fences if present
     text = re.sub(r'^```(?:json)?\s*', '', text.strip())
@@ -135,7 +135,13 @@ def call_claude(prompt):
     if not text:
         raise ValueError(f"Claude returned empty text. Stop reason: {response.stop_reason}")
 
-    return json.loads(text)
+    parsed = json.loads(text)
+    print(f"Parsed JSON: {json.dumps(parsed, indent=2)[:500]}")
+
+    if parsed is None:
+        raise ValueError("Claude returned null JSON")
+
+    return parsed
 
 def basil_team(query):
     today  = datetime.now().strftime('%A %d %B %Y')
