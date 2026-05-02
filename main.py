@@ -5,6 +5,7 @@ import random
 import string
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
 from functools import wraps
 
@@ -224,6 +225,38 @@ STRICT_SUFFIX = """
 
 CRITICAL: Return ONLY the JSON object. Not a single word before or after.
 If uncertain, use "Unknown" rather than adding narrative."""
+
+# ── Competitions to pre-fetch each morning ────────────────────────────────────
+
+PREFETCH_COMPETITIONS = [
+    ('English Premier League',          'football'),
+    ('Scottish Premiership',            'football'),
+    ('Scottish FA Cup',                 'football'),
+    ('UEFA Champions League',           'football'),
+    ('FIFA World Cup',                  'football'),
+    ('Gallagher Premiership',           'rugby'),
+    ('United Rugby Championship',       'rugby'),
+    ('Investec Champions Cup',          'rugby'),
+    ('European Rugby Challenge Cup',    'rugby'),
+    ('Six Nations',                     'rugby'),
+    ('Super Rugby',                     'rugby'),
+    ('Rugby World Cup',                 'rugby'),
+]
+
+COMPETITION_PREFETCH_PROMPT = """\
+You are Basil. Today is {today}.
+
+Search wheresthematch.com for any {competition} matches broadcast on UK TV today.
+For each match, also get current UK betting odds (Paddy Power, Bet365 or William Hill).
+Write a short fox fact for each match — real fox behaviour, under 50 words, \
+ends with a nudge to have a bet on this specific match.
+
+If there are NO matches today: {{"competition":"{competition}","matches":[]}}
+
+If matches found:
+{{"competition":"{competition}","matches":[{{"home_team":"","away_team":"","sport":"{sport}","kickoff":"","coverage_start":"","tv_channel":"","venue":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}]}}
+
+Return ONLY valid JSON."""
 
 # ── Claude caller ─────────────────────────────────────────────────────────────
 
@@ -518,14 +551,47 @@ def webhook():
 
 # ── 9am pre-fetch ─────────────────────────────────────────────────────────────
 
+def prefetch_competition(competition, sport, today):
+    """One Claude call fetches all TV matches for a competition and caches each team."""
+    try:
+        prompt = COMPETITION_PREFETCH_PROMPT.format(
+            today=today, competition=competition, sport=sport
+        )
+        data = call_claude(prompt)
+        matches = data.get('matches', [])
+        if not matches:
+            print(f"No matches today: {competition}")
+            return
+        for match in matches:
+            match['playing_today'] = True
+            for team_field in ['home_team', 'away_team']:
+                team = (match.get(team_field) or '').strip()
+                if team:
+                    set_cache(team, match)
+                    print(f"  Cached: {team}")
+    except Exception as e:
+        print(f"Pre-fetch error ({competition}): {e}")
+
 def prefetch():
-    print("Pre-fetching today's matches...")
+    """9am job: cache sport listings then all competition matches in parallel."""
+    today = datetime.now().strftime('%A %d %B %Y')
+    print(f"=== PRE-FETCH START: {today} ===")
+
+    # Sport listings first
     for sport in ['football', 'rugby']:
         try:
-            data = basil_sport(sport)
-            print(f"Pre-fetched {sport}: {len(data.get('matches', []))} matches")
+            basil_sport(sport)
+            print(f"Cached {sport} listings")
         except Exception as e:
-            print(f"Pre-fetch error ({sport}): {e}")
+            print(f"Error caching {sport}: {e}")
+        time.sleep(3)
+
+    # All competitions in parallel — max 2 at once to stay within rate limits
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        for competition, sport in PREFETCH_COMPETITIONS:
+            executor.submit(prefetch_competition, competition, sport, today)
+
+    print("=== PRE-FETCH COMPLETE ===")
 
 scheduler = BackgroundScheduler(timezone='Europe/London')
 scheduler.add_job(prefetch, 'cron', hour=9, minute=0)
