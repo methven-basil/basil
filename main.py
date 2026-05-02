@@ -107,25 +107,36 @@ Return ONLY valid JSON — no markdown, no explanation, no backticks, nothing el
 # ── Claude caller ─────────────────────────────────────────────────────────────
 
 def call_claude(prompt):
-    response = claude.messages.create(
-        model='claude-sonnet-4-20250514',
-        max_tokens=2000,
-        messages=[{'role': 'user', 'content': prompt}],
-        tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
-    )
+    print(f"=== CALLING CLAUDE ===")
+    print(f"Prompt preview: {prompt[:100]}")
 
-    # Debug logging — visible in Railway logs
-    print(f"=== CLAUDE RESPONSE ===")
+    # Try with web search tool first
+    try:
+        response = claude.messages.create(
+            model='claude-sonnet-4-6',
+            max_tokens=2000,
+            messages=[{'role': 'user', 'content': prompt}],
+            tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
+        )
+        print("Used web search tool successfully")
+    except Exception as tool_err:
+        print(f"Web search tool failed ({tool_err}), falling back to no tools")
+        response = claude.messages.create(
+            model='claude-sonnet-4-6',
+            max_tokens=2000,
+            messages=[{'role': 'user', 'content': prompt}]
+        )
+
     print(f"Stop reason: {response.stop_reason}")
     print(f"Content blocks: {len(response.content)}")
     for i, block in enumerate(response.content):
         btype = getattr(block, 'type', 'unknown')
-        btext = getattr(block, 'text', '')[:300] if hasattr(block, 'text') else ''
+        btext = (getattr(block, 'text', '') or '')[:200]
         print(f"  Block {i}: type={btype} | text={btext}")
 
-    # Extract all text blocks (guard against None text values)
-    text = ''.join((b.text or '') for b in response.content if getattr(b, 'type', '') == 'text')
-    print(f"Extracted text (full): '{text}'")
+    # Extract all text blocks
+    text = ''.join((getattr(b, 'text', '') or '') for b in response.content if getattr(b, 'type', '') == 'text')
+    print(f"Extracted text: '{text[:500]}'")
 
     # Clean markdown fences if present
     text = re.sub(r'^```(?:json)?\s*', '', text.strip())
@@ -133,13 +144,13 @@ def call_claude(prompt):
     text = text.strip()
 
     if not text:
-        raise ValueError(f"Claude returned empty text. Stop reason: {response.stop_reason}")
+        raise ValueError(f"Empty response. Stop reason: {response.stop_reason}")
 
     parsed = json.loads(text)
-    print(f"Parsed JSON: {json.dumps(parsed, indent=2)[:500]}")
+    print(f"Parsed successfully: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}")
 
-    if parsed is None:
-        raise ValueError("Claude returned null JSON")
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Expected dict, got {type(parsed)}")
 
     return parsed
 
