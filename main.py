@@ -25,6 +25,14 @@ SUPABASE_URL       = os.environ['SUPABASE_URL']
 SUPABASE_KEY       = os.environ['SUPABASE_KEY']
 ADMIN_PASSWORD     = os.environ['ADMIN_PASSWORD']
 
+# ── Affiliate IDs (add after registering with each bookmaker) ─────────────────
+AFFILIATE_IDS = {
+    'paddypower':  os.environ.get('AFFILIATE_PADDYPOWER', ''),
+    'bet365':      os.environ.get('AFFILIATE_BET365', ''),
+    'skybet':      os.environ.get('AFFILIATE_SKYBET', ''),
+    'williamhill': os.environ.get('AFFILIATE_WILLIAMHILL', ''),
+}
+
 # ── Clients ───────────────────────────────────────────────────────────────────
 
 twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -106,53 +114,63 @@ Return ONLY valid JSON — no markdown, no explanation, no backticks, nothing el
 
 # ── Claude caller ─────────────────────────────────────────────────────────────
 
+def extract_json(text):
+    """Extract JSON object from text, even if surrounded by narrative."""
+    # First try the whole text
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Try to find a JSON object within the text
+    start = text.find('{')
+    end   = text.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end+1])
+        except Exception:
+            pass
+    return None
+
+STRICT_SUFFIX = """
+
+CRITICAL: Your response must be ONLY the JSON object. Not a single word before or after it.
+If you cannot find the information, still return the JSON with your best estimates and 
+"Unknown" for fields you cannot confirm. Never return narrative text."""
+
 def call_claude(prompt):
     print(f"=== CALLING CLAUDE ===")
-    print(f"Prompt preview: {prompt[:100]}")
 
-    # Try with web search tool first
-    try:
-        response = claude.messages.create(
-            model='claude-sonnet-4-6',
-            max_tokens=2000,
-            messages=[{'role': 'user', 'content': prompt}],
-            tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
-        )
-        print("Used web search tool successfully")
-    except Exception as tool_err:
-        print(f"Web search tool failed ({tool_err}), falling back to no tools")
-        response = claude.messages.create(
-            model='claude-sonnet-4-6',
-            max_tokens=2000,
-            messages=[{'role': 'user', 'content': prompt}]
-        )
+    for attempt in range(2):
+        p = prompt if attempt == 0 else prompt + STRICT_SUFFIX
+        try:
+            response = claude.messages.create(
+                model='claude-sonnet-4-6',
+                max_tokens=2000,
+                messages=[{'role': 'user', 'content': p}],
+                tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
+            )
+        except Exception as tool_err:
+            print(f"Web search failed ({tool_err}), retrying without tools")
+            response = claude.messages.create(
+                model='claude-sonnet-4-6',
+                max_tokens=2000,
+                messages=[{'role': 'user', 'content': p}]
+            )
 
-    print(f"Stop reason: {response.stop_reason}")
-    print(f"Content blocks: {len(response.content)}")
-    for i, block in enumerate(response.content):
-        btype = getattr(block, 'type', 'unknown')
-        btext = (getattr(block, 'text', '') or '')[:200]
-        print(f"  Block {i}: type={btype} | text={btext}")
+        print(f"Attempt {attempt+1} — stop: {response.stop_reason}, blocks: {len(response.content)}")
+        text = ''.join((getattr(b, 'text', '') or '') for b in response.content
+                       if getattr(b, 'type', '') == 'text')
+        text = re.sub(r'^```(?:json)?\s*', '', text.strip())
+        text = re.sub(r'\s*```$', '', text).strip()
+        print(f"Text: '{text[:300]}'")
 
-    # Extract all text blocks
-    text = ''.join((getattr(b, 'text', '') or '') for b in response.content if getattr(b, 'type', '') == 'text')
-    print(f"Extracted text: '{text[:500]}'")
+        parsed = extract_json(text)
+        if parsed and isinstance(parsed, dict):
+            print(f"Parsed OK: {list(parsed.keys())}")
+            return parsed
+        print(f"Attempt {attempt+1} failed to parse JSON, retrying...")
 
-    # Clean markdown fences if present
-    text = re.sub(r'^```(?:json)?\s*', '', text.strip())
-    text = re.sub(r'\s*```$', '', text)
-    text = text.strip()
-
-    if not text:
-        raise ValueError(f"Empty response. Stop reason: {response.stop_reason}")
-
-    parsed = json.loads(text)
-    print(f"Parsed successfully: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}")
-
-    if not isinstance(parsed, dict):
-        raise ValueError(f"Expected dict, got {type(parsed)}")
-
-    return parsed
+    raise ValueError("Could not extract valid JSON after 2 attempts")
 
 def basil_team(query):
     today  = datetime.now().strftime('%A %d %B %Y')
@@ -166,8 +184,26 @@ def basil_sport(sport):
 
 # ── Message formatters ────────────────────────────────────────────────────────
 
+def affiliate_url(base_url, bookmaker):
+    """Append affiliate tracking parameter to bookmaker URL if ID is set."""
+    key = bookmaker.lower().replace(' ', '').replace('-', '')
+    aff = AFFILIATE_IDS.get(key, '')
+    if not aff or not base_url:
+        return base_url
+    sep = '&' if '?' in base_url else '?'
+    params = {
+        'paddypower':  f'af={aff}',
+        'bet365':      f'affiliate={aff}',
+        'skybet':      f'af={aff}',
+        'williamhill': f'aff={aff}',
+    }
+    return f"{base_url}{sep}{params.get(key, f'ref={aff}')}"
+
+def sport_emoji(sport):
+    return '🏉' if str(sport).lower() == 'rugby' else '⚽'
 def fmt_team(d):
-    e = '🏉' if d.get('sport') == 'rugby' else '⚽'
+    e   = sport_emoji(d.get('sport', ''))
+    url = affiliate_url(d.get('bookmaker_url', ''), d.get('bookmaker', ''))
 
     if d.get('playing_today'):
         lines = [
@@ -190,7 +226,7 @@ def fmt_team(d):
             d['fox_fact'],
             '',
             "📲 *Want a flutter?*",
-            d['bookmaker_url'],
+            url,
         ]
     else:
         lines = [
@@ -205,7 +241,8 @@ def fmt_team(d):
     return '\n'.join(lines)
 
 def fmt_sport(d):
-    e = '🏉' if d.get('sport') == 'rugby' else '⚽'
+    e   = sport_emoji(d.get('sport', ''))
+    url = affiliate_url(d.get('bookmaker_url', ''), d.get('bookmaker', ''))
     lines = ["🦊 *Basil's picks for today...*\n"]
     for m in d.get('matches', []):
         lines.append(f"{e} *{m['home_team']} vs {m['away_team']}*")
@@ -215,7 +252,7 @@ def fmt_sport(d):
         d['fox_fact'],
         '',
         "📲 *Have a flutter:*",
-        d['bookmaker_url'],
+        url,
     ]
     return '\n'.join(lines)
 
