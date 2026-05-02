@@ -179,10 +179,10 @@ The user has sent: "{query}"
 
 Your tasks:
 1. Work out if this is a football or rugby union team (use common sense).
-2. Search wheresthematch.com to find whether they are playing TODAY.
-3. If playing today: get the UK TV channel, kick-off time, coverage start time, and current odds \
+2. Search wheresthematch.com to find whether they are playing TODAY or TOMORROW.
+3. If playing today or tomorrow: get the UK TV channel, kick-off time, coverage start time, and current odds \
 from a UK bookmaker (Paddy Power, Bet365 or William Hill).
-4. If NOT playing today: find their very next fixture - date, TV channel, kick-off time.
+4. If NOT playing today or tomorrow: find their very next fixture - date, TV channel, kick-off time.
 5. For both cases: check if the match is also on UK radio (BBC Radio 5 Live, talkSPORT, \
 BBC Radio Scotland, BBC Radio Wales, BBC Radio Ulster). Only include radio if you are confident \
 it is being broadcast. Leave radio_station blank if unsure - do not guess.
@@ -190,7 +190,12 @@ it is being broadcast. Leave radio_station blank if unsure - do not guess.
 ends with a one-liner connecting fox instinct to having a wager on this match.
 
 IMPORTANT - always report from the perspective of the team the user searched for.
-If they are the away team, still list them first as home_team in the JSON.
+Always show the searched team first, then their opponent. Make clear in the venue field \
+whether the searched team is home or away (e.g. "Away at Stade Atlantique, Bordeaux" if away).
+
+IMPORTANT - if the match is TODAY, set playing_today to true.
+If the match is TOMORROW or within 24 hours, still set playing_today to false but set \
+next_date to "Tomorrow" rather than the full date.
 
 IMPORTANT - if multiple very different teams could match this name (e.g. "Saints" = Southampton FC,
 Northampton Saints rugby, St Mirren FC), return the ambiguous response instead.
@@ -412,9 +417,12 @@ def fmt_team(d, body=''):
         ]
     else:
         searched = d.get('home_team', body)
+        next_date = d.get('next_date', 'TBC')
+        when = "Tomorrow" if next_date == "Tomorrow" else next_date
         lines = [
-            f"🦊 *{searched} aren't on TV today.*\n",
-            f"Next up: *{d.get('home_team','?')} vs {d.get('away_team','TBC')}*",
+            f"🦊 *{searched} are playing {when}.*\n" if next_date == "Tomorrow"
+            else f"🦊 *{searched} aren't on TV today.*\n",
+            f"*{d.get('home_team','?')} vs {d.get('away_team','TBC')}*",
             f"{d.get('competition','')} | {d.get('venue','')}",
         ]
         tv = d.get('tv_channel', '')
