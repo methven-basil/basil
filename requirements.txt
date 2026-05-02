@@ -3,3 +3,4 @@ twilio==9.4.1
 anthropic==0.50.0
 supabase==2.15.0
 gunicorn==23.0.0
+apscheduler==3.10.4
