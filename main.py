@@ -182,7 +182,10 @@ Your tasks:
 3. If playing today: get the UK TV channel, kick-off time, coverage start time, and current odds \
 from a UK bookmaker (Paddy Power, Bet365 or William Hill).
 4. If NOT playing today: find their very next fixture — date, TV channel, kick-off time.
-5. Write a fox fact: genuinely surprising, based on real fox behaviour, under 60 words, \
+5. For both cases: check if the match is also on UK radio (BBC Radio 5 Live, talkSPORT, \
+BBC Radio Scotland, BBC Radio Wales, BBC Radio Ulster). Only include radio if you are confident \
+it is being broadcast. Leave radio_station blank if unsure — do not guess.
+6. Write a fox fact: genuinely surprising, based on real fox behaviour, under 60 words, \
 ends with a one-liner connecting fox instinct to having a wager on this match.
 
 IMPORTANT — always report from the perspective of the team the user searched for.
@@ -195,10 +198,10 @@ Only use ambiguous if teams are from genuinely different sports or leagues — d
 Return ONLY valid JSON — no markdown, no explanation, no backticks.
 
 If playing TODAY:
-{{"playing_today":true,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","kickoff":"","coverage_start":"","tv_channel":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}
+{{"playing_today":true,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","kickoff":"","coverage_start":"","tv_channel":"","radio_station":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}
 
 If NOT playing today:
-{{"playing_today":false,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","next_date":"","kickoff":"","tv_channel":"","fox_fact":""}}
+{{"playing_today":false,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","next_date":"","kickoff":"","tv_channel":"","radio_station":"","fox_fact":""}}
 
 If AMBIGUOUS (multiple plausible matches from different sports/leagues):
 {{"ambiguous":true,"options":[{{"label":"Full Team Name (sport)","query":"Exact search term"}}]}}
@@ -391,6 +394,8 @@ def fmt_team(d, body=''):
         ]
         cov = d.get('coverage_start')
         lines.append(f"Coverage {cov} | KO {d['kickoff']}" if cov else f"KO {d['kickoff']}")
+        if d.get('radio_station'):
+            lines.append(f"📻 Also on {d['radio_station']}")
         lines += [
             '',
             f"💰 *Odds ({d['bookmaker']})*",
@@ -407,7 +412,19 @@ def fmt_team(d, body=''):
             f"🦊 *{searched} aren't on TV today.*\n",
             f"Next up: *{d.get('home_team','?')} vs {d.get('away_team','TBC')}*",
             f"{d.get('competition','')} | {d.get('venue','')}",
-            f"📺 {d.get('tv_channel','TBC')} — {d.get('next_date','TBC')}, KO {d.get('kickoff','TBC')}\n",
+        ]
+        tv = d.get('tv_channel', '')
+        radio = d.get('radio_station', '')
+        if tv and tv.lower() not in ('', 'unknown', 'none'):
+            lines.append(f"📺 {tv} — {d.get('next_date','TBC')}, KO {d.get('kickoff','TBC')}")
+        elif radio:
+            lines.append(f"📻 {radio} — {d.get('next_date','TBC')}, KO {d.get('kickoff','TBC')}")
+        else:
+            lines.append(f"📺 Not yet confirmed — {d.get('next_date','TBC')}, KO {d.get('kickoff','TBC')}")
+        if tv and radio:
+            lines.append(f"📻 Also on {radio}")
+        lines += [
+            '',
             "🦊 *Basil says:*",
             d.get('fox_fact', ''),
         ]
