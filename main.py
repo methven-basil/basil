@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import json
 import re
@@ -145,13 +146,13 @@ The user sent: "{message}"
 
 Sports teams often have short or place-based names like "Bath", "Hull", "Sale", "Wasps",
 "Saints", "Blues", "Reds", "City", "United", "Rangers", "Celtic", "Ajax", "Lyon" etc.
-Be generous — if there is any reasonable chance this could be a sports team name, say "sport".
+Be generous - if there is any reasonable chance this could be a sports team name, say "sport".
 
-Reply with ONLY one of these three words — nothing else:
+Reply with ONLY one of these three words - nothing else:
 
-sport     — if this could plausibly be a sports team name or nickname, or the words football / rugby / soccer
-unclear   — if it is genuinely ambiguous and could not be a team (e.g. a partial sentence, random letters)
-offtopic  — if this is clearly not sports-related (a question, general chat, gibberish, instructions)"""
+sport     - if this could plausibly be a sports team name or nickname, or the words football / rugby / soccer
+unclear   - if it is genuinely ambiguous and could not be a team (e.g. a partial sentence, random letters)
+offtopic  - if this is clearly not sports-related (a question, general chat, gibberish, instructions)"""
 
 def check_intent(message):
     try:
@@ -170,7 +171,7 @@ def check_intent(message):
 # ── Claude prompts ────────────────────────────────────────────────────────────
 
 TEAM_PROMPT = """\
-You are Basil — a sharp, witty fox who helps UK sports fans find their team on TV.
+You are Basil - a sharp, witty fox who helps UK sports fans find their team on TV.
 
 Today is {today}.
 
@@ -181,21 +182,21 @@ Your tasks:
 2. Search wheresthematch.com to find whether they are playing TODAY.
 3. If playing today: get the UK TV channel, kick-off time, coverage start time, and current odds \
 from a UK bookmaker (Paddy Power, Bet365 or William Hill).
-4. If NOT playing today: find their very next fixture — date, TV channel, kick-off time.
+4. If NOT playing today: find their very next fixture - date, TV channel, kick-off time.
 5. For both cases: check if the match is also on UK radio (BBC Radio 5 Live, talkSPORT, \
 BBC Radio Scotland, BBC Radio Wales, BBC Radio Ulster). Only include radio if you are confident \
-it is being broadcast. Leave radio_station blank if unsure — do not guess.
+it is being broadcast. Leave radio_station blank if unsure - do not guess.
 6. Write a fox fact: genuinely surprising, based on real fox behaviour, under 60 words, \
 ends with a one-liner connecting fox instinct to having a wager on this match.
 
-IMPORTANT — always report from the perspective of the team the user searched for.
+IMPORTANT - always report from the perspective of the team the user searched for.
 If they are the away team, still list them first as home_team in the JSON.
 
-IMPORTANT — if multiple very different teams could match this name (e.g. "Saints" = Southampton FC,
+IMPORTANT - if multiple very different teams could match this name (e.g. "Saints" = Southampton FC,
 Northampton Saints rugby, St Mirren FC), return the ambiguous response instead.
-Only use ambiguous if teams are from genuinely different sports or leagues — don't overthink it.
+Only use ambiguous if teams are from genuinely different sports or leagues - don't overthink it.
 
-Return ONLY valid JSON — no markdown, no explanation, no backticks.
+Return ONLY valid JSON - no markdown, no explanation, no backticks.
 
 If playing TODAY:
 {{"playing_today":true,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","kickoff":"","coverage_start":"","tv_channel":"","radio_station":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}
@@ -210,7 +211,7 @@ If team cannot be identified at all:
 {{"clarify":true,"message":"Short friendly message asking user to check spelling."}}"""
 
 SPORT_PROMPT = """\
-You are Basil — a sharp, witty fox who helps UK sports fans find what's on TV.
+You are Basil - a sharp, witty fox who helps UK sports fans find what's on TV.
 
 Today is {today}.
 
@@ -220,9 +221,11 @@ Search wheresthematch.com for today's {sport} TV listings. Pick the 4-5 most not
 
 Write a fox fact under 50 words that ends with a witty nudge toward having a flutter.
 
-Return ONLY valid JSON — no markdown, no explanation, no backticks:
+Return ONLY valid JSON - no markdown, no explanation, no backticks:
 
 {{"sport":"{sport}","matches":[{{"home_team":"","away_team":"","competition":"","kickoff":"","tv_channel":""}}],"fox_fact":"","bookmaker":"Paddy Power","bookmaker_url":"https://www.paddypower.com"}}"""
+
+GAMBLING_REMINDER = "\n\n_18+ Gamble responsibly. begambleaware.org_"
 
 STRICT_SUFFIX = """
 
@@ -251,7 +254,7 @@ You are Basil. Today is {today}.
 
 Search wheresthematch.com for any {competition} matches broadcast on UK TV today.
 For each match, also get current UK betting odds (Paddy Power, Bet365 or William Hill).
-Write a short fox fact for each match — real fox behaviour, under 50 words, \
+Write a short fox fact for each match - real fox behaviour, under 50 words, \
 ends with a nudge to have a bet on this specific match.
 
 If there are NO matches today: {{"competition":"{competition}","matches":[]}}
@@ -301,7 +304,7 @@ def call_claude(prompt):
                         )
                     else:
                         raise
-                break  # success — exit retry loop
+                break  # success - exit retry loop
 
             except Exception as e:
                 if '429' in str(e) or 'rate_limit' in str(e).lower():
@@ -364,7 +367,7 @@ def go(bk):
     return redirect(url, 302)
 
 def make_bet_url(base_url, bookmaker):
-    """Return a short /go/ URL — no OG tags so WhatsApp won't generate a preview."""
+    """Return a short /go/ URL - no OG tags so WhatsApp will not generate a preview."""
     shortcodes = {
         'paddypower': 'pp', 'paddy power': 'pp',
         'bet365': 'b365',
@@ -405,6 +408,7 @@ def fmt_team(d, body=''):
             '',
             "📲 *Want a flutter?*",
             url,
+            GAMBLING_REMINDER,
         ]
     else:
         searched = d.get('home_team', body)
@@ -416,11 +420,11 @@ def fmt_team(d, body=''):
         tv = d.get('tv_channel', '')
         radio = d.get('radio_station', '')
         if tv and tv.lower() not in ('', 'unknown', 'none'):
-            lines.append(f"📺 {tv} — {d.get('next_date','TBC')}, KO {d.get('kickoff','TBC')}")
+            lines.append(f"📺 {tv} - {d.get('next_date','TBC')}, KO {d.get('kickoff','TBC')}")
         elif radio:
-            lines.append(f"📻 {radio} — {d.get('next_date','TBC')}, KO {d.get('kickoff','TBC')}")
+            lines.append(f"📻 {radio} - {d.get('next_date','TBC')}, KO {d.get('kickoff','TBC')}")
         else:
-            lines.append(f"📺 Not yet confirmed — {d.get('next_date','TBC')}, KO {d.get('kickoff','TBC')}")
+            lines.append(f"📺 Not yet confirmed - {d.get('next_date','TBC')}, KO {d.get('kickoff','TBC')}")
         if tv and radio:
             lines.append(f"📻 Also on {radio}")
         lines += [
@@ -436,6 +440,7 @@ def fmt_team(d, body=''):
                 f"{d.get('home_team','?')}: {d['home_odds']} | Draw: {d.get('draw_odds','')} | {d.get('away_team','?')}: {d.get('away_odds','')}\n",
                 "📲 *Want a flutter?*",
                 url,
+                GAMBLING_REMINDER,
             ]
     return '\n'.join(lines)
 
@@ -445,12 +450,12 @@ def fmt_sport(d):
     lines = ["🦊 *Basil's picks for today...*\n"]
     for m in d.get('matches', []):
         lines.append(f"{e} *{m['home_team']} vs {m['away_team']}*")
-        lines.append(f"{m['competition']} — {m['tv_channel']}, KO {m['kickoff']}\n")
-    lines += ["🦊 *Basil says:*", d.get('fox_fact', ''), '', "📲 *Have a flutter:*", url]
+        lines.append(f"{m['competition']} - {m['tv_channel']}, KO {m['kickoff']}\n")
+    lines += ["🦊 *Basil says:*", d.get('fox_fact', ''), '', "📲 *Have a flutter:*", url, GAMBLING_REMINDER]
     return '\n'.join(lines)
 
 def fmt_ambiguous(options, original):
-    lines = [f"🦊 A few teams go by *{original}* — which did you mean?\n"]
+    lines = [f"🦊 A few teams go by *{original}* - which did you mean?\n"]
     for i, opt in enumerate(options, 1):
         lines.append(f"{i}️⃣ {opt['label']}")
     lines.append("\nReply with the number.")
@@ -478,7 +483,7 @@ def process_async(from_wa, body, phone):
                 set_pending(phone, options, body)
                 reply = fmt_ambiguous(options, body)
             elif data.get('clarify'):
-                reply = f"🦊 {data.get('message', 'Not sure who you mean — could you check the team name?')}"
+                reply = f"🦊 {data.get('message', 'Not sure who you mean - could you check the team name?')}"
             else:
                 reply = fmt_team(data, body)
 
@@ -489,9 +494,9 @@ def process_async(from_wa, body, phone):
         msg = str(ex)
         print(f'ERROR processing "{body}": {msg}')
         if '429' in msg or 'rate_limit' in msg.lower():
-            send(from_wa, "🦊 Basil's getting a lot of requests right now — give it a minute and try again.")
+            send(from_wa, "🦊 Basil's getting a lot of requests right now - give it a minute and try again.")
         else:
-            send(from_wa, "🦊 Basil's nose is twitching — something went wrong. Try again in a moment.")
+            send(from_wa, "🦊 Basil's nose is twitching - something went wrong. Try again in a moment.")
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 
@@ -523,7 +528,7 @@ def webhook():
                      "🦊 *Welcome to Basil!*\n\n"
                      "Send me any team name and I'll tell you what channel they're on, "
                      "the latest odds, and a little something to think about.\n\n"
-                     "Go on then — try a team name.")
+                     "Go on then - try a team name.")
         return Response('', 204)
 
     # ── Not registered ────────────────────────────────────────────────────────
@@ -552,7 +557,7 @@ def webhook():
 
     # ── Rate limit ────────────────────────────────────────────────────────────
     if get_today_count(phone) >= DAILY_QUERY_LIMIT:
-        send(from_wa, f"🦊 You've had {DAILY_QUERY_LIMIT} queries today — even foxes need a rest. Try again tomorrow.")
+        send(from_wa, f"🦊 You've had {DAILY_QUERY_LIMIT} queries today - even foxes need a rest. Try again tomorrow.")
         return Response('', 204)
 
     # ── Gatekeeper ────────────────────────────────────────────────────────────
@@ -565,7 +570,7 @@ def webhook():
             return Response('', 204)
         if intent == 'unclear':
             log_query(phone, body, 'BLOCKED:unclear')
-            send(from_wa, f"🦊 Not sure who you mean by *{body}* — could you check the spelling or give me the full team name?")
+            send(from_wa, f"🦊 Not sure who you mean by *{body}* - could you check the spelling or give me the full team name?")
             return Response('', 204)
 
     # ── Fire and forget ───────────────────────────────────────────────────────
@@ -599,7 +604,7 @@ def prefetch_competition(competition, sport, today):
         print(f"Pre-fetch error ({competition}): {e}")
 
 def prefetch():
-    """9am job: cache sport listings then all competition matches in parallel."""
+    """Morning job: cache sport listings then all competition matches in parallel."""
     today = datetime.now().strftime('%A %d %B %Y')
     print(f"=== PRE-FETCH START: {today} ===")
 
@@ -612,7 +617,7 @@ def prefetch():
             print(f"Error caching {sport}: {e}")
         time.sleep(3)
 
-    # All competitions in parallel — max 2 at once to stay within rate limits
+    # All competitions in parallel - max 2 at once to stay within rate limits
     with ThreadPoolExecutor(max_workers=2) as executor:
         for competition, sport in PREFETCH_COMPETITIONS:
             executor.submit(prefetch_competition, competition, sport, today)
@@ -878,7 +883,7 @@ ADMIN_HTML = '''<!doctype html>
       {% for c in codes %}
       <tr>
         <td><span class="badge code-badge">{{ c.code }}</span></td>
-        <td>{{ c.note or "—" }}</td>
+        <td>{{ c.note or "-" }}</td>
         <td>{{ c.uses_count }} / {{ c.max_uses }}</td>
         <td>
           <form method="post" action="/admin/delete-code" style="display:inline">
