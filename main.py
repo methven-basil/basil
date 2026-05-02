@@ -3,6 +3,7 @@ import json
 import re
 import random
 import string
+import threading
 from datetime import datetime, date
 from functools import wraps
 
@@ -11,6 +12,7 @@ from flask import (Flask, request, Response,
 from twilio.rest import Client as TwilioClient
 import anthropic
 from supabase import create_client
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'basil-fox-secret-changeme')
@@ -19,18 +21,18 @@ app.secret_key = os.environ.get('SECRET_KEY', 'basil-fox-secret-changeme')
 
 TWILIO_ACCOUNT_SID = os.environ['TWILIO_ACCOUNT_SID']
 TWILIO_AUTH_TOKEN  = os.environ['TWILIO_AUTH_TOKEN']
-TWILIO_FROM        = 'whatsapp:+14155238886'   # Sandbox number
+TWILIO_FROM        = 'whatsapp:+14155238886'
 ANTHROPIC_API_KEY  = os.environ['ANTHROPIC_API_KEY']
 SUPABASE_URL       = os.environ['SUPABASE_URL']
 SUPABASE_KEY       = os.environ['SUPABASE_KEY']
 ADMIN_PASSWORD     = os.environ['ADMIN_PASSWORD']
 DAILY_QUERY_LIMIT  = int(os.environ.get('DAILY_QUERY_LIMIT', '20'))
+RAILWAY_HOST       = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
 
-# ── Affiliate IDs (add after registering with each bookmaker) ─────────────────
+# ── Affiliate IDs ─────────────────────────────────────────────────────────────
 AFFILIATE_IDS = {
     'paddypower':  os.environ.get('AFFILIATE_PADDYPOWER', ''),
     'bet365':      os.environ.get('AFFILIATE_BET365', ''),
-    'skybet':      os.environ.get('AFFILIATE_SKYBET', ''),
     'williamhill': os.environ.get('AFFILIATE_WILLIAMHILL', ''),
 }
 
@@ -73,7 +75,6 @@ def log_query(phone, query, response):
     }).execute()
 
 def get_today_count(phone):
-    """Count non-blocked queries this user has made today."""
     today = date.today().isoformat()
     r = db.table('queries').select('id')\
         .eq('phone_number', phone)\
@@ -82,15 +83,66 @@ def get_today_count(phone):
         .execute()
     return len(r.data)
 
-# ── Gatekeeper (fast Haiku check before the expensive search) ─────────────────
+# ── Cache helpers ─────────────────────────────────────────────────────────────
+
+def cache_key(query):
+    return f"{date.today().isoformat()}:{query.lower().strip()}"
+
+def get_cache(query):
+    try:
+        r = db.table('cache').select('data').eq('cache_key', cache_key(query)).execute()
+        if r.data:
+            print(f"Cache hit: {query}")
+            return json.loads(r.data[0]['data'])
+    except Exception as e:
+        print(f"Cache read error: {e}")
+    return None
+
+def set_cache(query, data):
+    try:
+        db.table('cache').upsert({
+            'cache_key': cache_key(query),
+            'data':      json.dumps(data),
+            'cached_at': datetime.utcnow().isoformat()
+        }).execute()
+    except Exception as e:
+        print(f"Cache write error: {e}")
+
+# ── Pending disambiguation helpers ────────────────────────────────────────────
+
+def get_pending(phone):
+    try:
+        r = db.table('pending').select('*').eq('phone_number', phone).execute()
+        return r.data[0] if r.data else None
+    except Exception:
+        return None
+
+def set_pending(phone, options, original_query):
+    try:
+        db.table('pending').upsert({
+            'phone_number':   phone,
+            'options':        json.dumps(options),
+            'original_query': original_query,
+            'created_at':     datetime.utcnow().isoformat()
+        }).execute()
+    except Exception as e:
+        print(f"Pending write error: {e}")
+
+def clear_pending(phone):
+    try:
+        db.table('pending').delete().eq('phone_number', phone).execute()
+    except Exception as e:
+        print(f"Pending clear error: {e}")
+
+# ── Gatekeeper ────────────────────────────────────────────────────────────────
 
 GATEKEEPER_PROMPT = """\
 You are a one-word classifier for a UK sports TV listings bot.
 
 The user sent: "{message}"
 
-Sports teams often have short or place-based names like "Bath", "Hull", "Sale", "Wasps", \
-"Saints", "Blues", "Reds", "City", "United", "Rangers", "Celtic" etc. \
+Sports teams often have short or place-based names like "Bath", "Hull", "Sale", "Wasps",
+"Saints", "Blues", "Reds", "City", "United", "Rangers", "Celtic", "Ajax", "Lyon" etc.
 Be generous — if there is any reasonable chance this could be a sports team name, say "sport".
 
 Reply with ONLY one of these three words — nothing else:
@@ -100,7 +152,6 @@ unclear   — if it is genuinely ambiguous and could not be a team (e.g. a parti
 offtopic  — if this is clearly not sports-related (a question, general chat, gibberish, instructions)"""
 
 def check_intent(message):
-    """Cheap Haiku gatekeeper — runs before the full web search call."""
     try:
         r = claude.messages.create(
             model='claude-haiku-4-5-20251001',
@@ -112,7 +163,7 @@ def check_intent(message):
         return verdict if verdict in ('sport', 'unclear', 'offtopic') else 'sport'
     except Exception as e:
         print(f"Gatekeeper error: {e}")
-        return 'sport'  # fail open
+        return 'sport'
 
 # ── Claude prompts ────────────────────────────────────────────────────────────
 
@@ -124,28 +175,34 @@ Today is {today}.
 The user has sent: "{query}"
 
 Your tasks:
-1. Work out if this is a football or rugby union team (use common sense — Leinster is rugby, Arsenal is football).
+1. Work out if this is a football or rugby union team (use common sense).
 2. Search wheresthematch.com to find whether they are playing TODAY.
 3. If playing today: get the UK TV channel, kick-off time, coverage start time, and current odds \
-from a UK bookmaker (Paddy Power, Bet365, Sky Bet or William Hill).
+from a UK bookmaker (Paddy Power, Bet365 or William Hill).
 4. If NOT playing today: find their very next fixture — date, TV channel, kick-off time.
-5. Write a fox fact. Rules: genuinely surprising or funny, based on real fox behaviour, \
-under 60 words, ends with a one-liner that connects fox instinct to the idea of having a wager on this match.
+5. Write a fox fact: genuinely surprising, based on real fox behaviour, under 60 words, \
+ends with a one-liner connecting fox instinct to having a wager on this match.
 
 IMPORTANT — always report from the perspective of the team the user searched for.
-If the user searched "Bath Rugby" and Bath are the away team, still list Bath first as home_team \
-and their opponent as away_team. The user wants to know about THEIR team, not the host.
+If they are the away team, still list them first as home_team in the JSON.
 
-Return ONLY valid JSON — no markdown, no explanation, no backticks, nothing else.
+IMPORTANT — if multiple very different teams could match this name (e.g. "Saints" = Southampton FC,
+Northampton Saints rugby, St Mirren FC), return the ambiguous response instead.
+Only use ambiguous if teams are from genuinely different sports or leagues — don't overthink it.
 
-If playing TODAY use exactly this structure:
-{{"playing_today":true,"sport":"football","home_team":"","away_team":"","competition":"","venue":"","kickoff":"","coverage_start":"","tv_channel":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}
+Return ONLY valid JSON — no markdown, no explanation, no backticks.
 
-If NOT playing today use exactly this structure:
-{{"playing_today":false,"sport":"football","home_team":"","away_team":"","competition":"","venue":"","next_date":"","kickoff":"","tv_channel":"","fox_fact":""}}
+If playing TODAY:
+{{"playing_today":true,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","kickoff":"","coverage_start":"","tv_channel":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}
 
-If you genuinely cannot identify the team at all, use exactly this structure:
-{{"clarify":true,"message":"Brief friendly message asking the user to check their spelling or give the full team name."}}"""
+If NOT playing today:
+{{"playing_today":false,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","next_date":"","kickoff":"","tv_channel":"","fox_fact":""}}
+
+If AMBIGUOUS (multiple plausible matches from different sports/leagues):
+{{"ambiguous":true,"options":[{{"label":"Full Team Name (sport)","query":"Exact search term"}}]}}
+
+If team cannot be identified at all:
+{{"clarify":true,"message":"Short friendly message asking user to check spelling."}}"""
 
 SPORT_PROMPT = """\
 You are Basil — a sharp, witty fox who helps UK sports fans find what's on TV.
@@ -156,40 +213,34 @@ The user wants to know what {sport} matches are on UK TV TODAY.
 
 Search wheresthematch.com for today's {sport} TV listings. Pick the 4-5 most notable matches.
 
-Write a fox fact under 50 words that ends with a witty nudge toward having a flutter on today's action.
+Write a fox fact under 50 words that ends with a witty nudge toward having a flutter.
 
-Return ONLY valid JSON — no markdown, no explanation, no backticks, nothing else:
+Return ONLY valid JSON — no markdown, no explanation, no backticks:
 
-{{"sport":"{sport}","matches":[{{"home_team":"","away_team":"","competition":"","kickoff":"","tv_channel":""}}],"fox_fact":"","bookmaker":"Sky Bet","bookmaker_url":"https://www.skybet.com"}}"""
+{{"sport":"{sport}","matches":[{{"home_team":"","away_team":"","competition":"","kickoff":"","tv_channel":""}}],"fox_fact":"","bookmaker":"Paddy Power","bookmaker_url":"https://www.paddypower.com"}}"""
+
+STRICT_SUFFIX = """
+
+CRITICAL: Return ONLY the JSON object. Not a single word before or after.
+If uncertain, use "Unknown" rather than adding narrative."""
 
 # ── Claude caller ─────────────────────────────────────────────────────────────
 
 def extract_json(text):
-    """Extract JSON object from text, even if surrounded by narrative."""
-    # First try the whole text
     try:
         return json.loads(text)
     except Exception:
         pass
-    # Try to find a JSON object within the text
     start = text.find('{')
     end   = text.rfind('}')
-    if start != -1 and end != -1 and end > start:
+    if start != -1 and end > start:
         try:
             return json.loads(text[start:end+1])
         except Exception:
             pass
     return None
 
-STRICT_SUFFIX = """
-
-CRITICAL: Your response must be ONLY the JSON object. Not a single word before or after it.
-If you cannot find the information, still return the JSON with your best estimates and 
-"Unknown" for fields you cannot confirm. Never return narrative text."""
-
 def call_claude(prompt):
-    print(f"=== CALLING CLAUDE ===")
-
     for attempt in range(2):
         p = prompt if attempt == 0 else prompt + STRICT_SUFFIX
         try:
@@ -199,61 +250,85 @@ def call_claude(prompt):
                 messages=[{'role': 'user', 'content': p}],
                 tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
             )
-        except Exception as tool_err:
-            print(f"Web search failed ({tool_err}), retrying without tools")
+        except Exception as e:
+            print(f"Tool call failed ({e}), retrying without tools")
             response = claude.messages.create(
                 model='claude-sonnet-4-6',
                 max_tokens=2000,
                 messages=[{'role': 'user', 'content': p}]
             )
 
-        print(f"Attempt {attempt+1} — stop: {response.stop_reason}, blocks: {len(response.content)}")
-        text = ''.join((getattr(b, 'text', '') or '') for b in response.content
-                       if getattr(b, 'type', '') == 'text')
+        text = ''.join((getattr(b, 'text', '') or '')
+                       for b in response.content if getattr(b, 'type', '') == 'text')
         text = re.sub(r'^```(?:json)?\s*', '', text.strip())
         text = re.sub(r'\s*```$', '', text).strip()
-        print(f"Text: '{text[:300]}'")
+        print(f"Attempt {attempt+1}: '{text[:200]}'")
 
         parsed = extract_json(text)
         if parsed and isinstance(parsed, dict):
-            print(f"Parsed OK: {list(parsed.keys())}")
             return parsed
-        print(f"Attempt {attempt+1} failed to parse JSON, retrying...")
+        print(f"Attempt {attempt+1}: no valid JSON, retrying")
 
     raise ValueError("Could not extract valid JSON after 2 attempts")
 
 def basil_team(query):
+    cached = get_cache(query)
+    if cached:
+        return cached
     today  = datetime.now().strftime('%A %d %B %Y')
-    prompt = TEAM_PROMPT.format(today=today, query=query)
-    return call_claude(prompt)
+    result = call_claude(TEAM_PROMPT.format(today=today, query=query))
+    if result and not result.get('ambiguous') and not result.get('clarify'):
+        set_cache(query, result)
+    return result
 
 def basil_sport(sport):
+    cached = get_cache(sport)
+    if cached:
+        return cached
     today  = datetime.now().strftime('%A %d %B %Y')
-    prompt = SPORT_PROMPT.format(today=today, sport=sport)
-    return call_claude(prompt)
+    result = call_claude(SPORT_PROMPT.format(today=today, sport=sport))
+    if result:
+        set_cache(sport, result)
+    return result
+
+# ── Bookmaker redirect (prevents WhatsApp link preview + tracks clicks) ───────
+
+BK_MAP = {
+    'pp':   ('https://www.paddypower.com',  'paddypower'),
+    'b365': ('https://www.bet365.com',      'bet365'),
+    'wh':   ('https://www.williamhill.com', 'williamhill'),
+}
+
+@app.route('/go/<bk>')
+def go(bk):
+    """Redirect to bookmaker. Short URL prevents WhatsApp generating a link preview."""
+    base, key = BK_MAP.get(bk, ('https://www.paddypower.com', 'paddypower'))
+    aff = AFFILIATE_IDS.get(key, '')
+    sep = '&' if '?' in base else '?'
+    url = f"{base}{sep}af={aff}" if aff else base
+    return redirect(url, 302)
+
+def make_bet_url(base_url, bookmaker):
+    """Return a short /go/ URL — no OG tags so WhatsApp won't generate a preview."""
+    shortcodes = {
+        'paddypower': 'pp', 'paddy power': 'pp',
+        'bet365': 'b365',
+        'williamhill': 'wh', 'william hill': 'wh',
+    }
+    sc = shortcodes.get(bookmaker.lower().strip(), '')
+    if sc and RAILWAY_HOST:
+        return f"https://{RAILWAY_HOST}/go/{sc}"
+    # Fallback: strip scheme so WhatsApp won't auto-preview
+    return (base_url or '').replace('https://', '').replace('http://', '')
 
 # ── Message formatters ────────────────────────────────────────────────────────
 
-def affiliate_url(base_url, bookmaker):
-    """Append affiliate tracking parameter to bookmaker URL if ID is set."""
-    key = bookmaker.lower().replace(' ', '').replace('-', '')
-    aff = AFFILIATE_IDS.get(key, '')
-    if not aff or not base_url:
-        return base_url
-    sep = '&' if '?' in base_url else '?'
-    params = {
-        'paddypower':  f'af={aff}',
-        'bet365':      f'affiliate={aff}',
-        'skybet':      f'af={aff}',
-        'williamhill': f'aff={aff}',
-    }
-    return f"{base_url}{sep}{params.get(key, f'ref={aff}')}"
-
 def sport_emoji(sport):
     return '🏉' if str(sport).lower() == 'rugby' else '⚽'
+
 def fmt_team(d, body=''):
     e   = sport_emoji(d.get('sport', ''))
-    url = affiliate_url(d.get('bookmaker_url', ''), d.get('bookmaker', ''))
+    url = make_bet_url(d.get('bookmaker_url', ''), d.get('bookmaker', 'Paddy Power'))
 
     if d.get('playing_today'):
         lines = [
@@ -262,55 +337,81 @@ def fmt_team(d, body=''):
             f"{d['competition']} | {d['venue']}\n",
             f"📺 *{d['tv_channel']}*",
         ]
-        if d.get('coverage_start'):
-            lines.append(f"Coverage {d['coverage_start']} | KO {d['kickoff']}")
-        else:
-            lines.append(f"KO {d['kickoff']}")
+        cov = d.get('coverage_start')
+        lines.append(f"Coverage {cov} | KO {d['kickoff']}" if cov else f"KO {d['kickoff']}")
         lines += [
             '',
             f"💰 *Odds ({d['bookmaker']})*",
-            f"{d['home_team']}: {d['home_odds']} | "
-            f"Draw: {d['draw_odds']} | "
-            f"{d['away_team']}: {d['away_odds']}\n",
+            f"{d['home_team']}: {d['home_odds']} | Draw: {d['draw_odds']} | {d['away_team']}: {d['away_odds']}\n",
             "🦊 *Basil says:*",
-            d['fox_fact'],
+            d.get('fox_fact', ''),
             '',
             "📲 *Want a flutter?*",
             url,
         ]
     else:
-        searched = body  # original query from user
+        searched = d.get('home_team', body)
         lines = [
-            f"🦊 *{d.get('home_team', searched)} aren't on TV today.*\n",
-            f"Next up: *{d.get('home_team', searched)} vs {d.get('away_team', 'TBC')}*",
-            f"{d.get('competition', '')} | {d.get('venue', '')}",
-            f"📺 {d.get('tv_channel', 'TBC')} — {d.get('next_date', 'TBC')}, KO {d.get('kickoff', 'TBC')}\n",
+            f"🦊 *{searched} aren't on TV today.*\n",
+            f"Next up: *{d.get('home_team','?')} vs {d.get('away_team','TBC')}*",
+            f"{d.get('competition','')} | {d.get('venue','')}",
+            f"📺 {d.get('tv_channel','TBC')} — {d.get('next_date','TBC')}, KO {d.get('kickoff','TBC')}\n",
             "🦊 *Basil says:*",
             d.get('fox_fact', ''),
         ]
-
     return '\n'.join(lines)
 
 def fmt_sport(d):
     e   = sport_emoji(d.get('sport', ''))
-    url = affiliate_url(d.get('bookmaker_url', ''), d.get('bookmaker', ''))
+    url = make_bet_url(d.get('bookmaker_url', ''), d.get('bookmaker', 'Paddy Power'))
     lines = ["🦊 *Basil's picks for today...*\n"]
     for m in d.get('matches', []):
         lines.append(f"{e} *{m['home_team']} vs {m['away_team']}*")
         lines.append(f"{m['competition']} — {m['tv_channel']}, KO {m['kickoff']}\n")
-    lines += [
-        "🦊 *Basil says:*",
-        d['fox_fact'],
-        '',
-        "📲 *Have a flutter:*",
-        url,
-    ]
+    lines += ["🦊 *Basil says:*", d.get('fox_fact', ''), '', "📲 *Have a flutter:*", url]
     return '\n'.join(lines)
 
-# ── Webhook ───────────────────────────────────────────────────────────────────
+def fmt_ambiguous(options, original):
+    lines = [f"🦊 A few teams go by *{original}* — which did you mean?\n"]
+    for i, opt in enumerate(options, 1):
+        lines.append(f"{i}️⃣ {opt['label']}")
+    lines.append("\nReply with the number.")
+    return '\n'.join(lines)
+
+# ── Async query processor ─────────────────────────────────────────────────────
 
 def send(to, body):
     twilio.messages.create(from_=TWILIO_FROM, to=to, body=body)
+
+def process_async(from_wa, body, phone):
+    """Runs in background thread. Does the Claude work then sends reply."""
+    try:
+        q = body.lower().strip()
+        if q in ['football', 'soccer']:
+            data  = basil_sport('football')
+            reply = fmt_sport(data)
+        elif q == 'rugby':
+            data  = basil_sport('rugby')
+            reply = fmt_sport(data)
+        else:
+            data = basil_team(body)
+            if data.get('ambiguous'):
+                options = data.get('options', [])
+                set_pending(phone, options, body)
+                reply = fmt_ambiguous(options, body)
+            elif data.get('clarify'):
+                reply = f"🦊 {data.get('message', 'Not sure who you mean — could you check the team name?')}"
+            else:
+                reply = fmt_team(data, body)
+
+        log_query(phone, body, reply)
+        send(from_wa, reply)
+
+    except Exception as ex:
+        print(f'ERROR processing "{body}": {ex}')
+        send(from_wa, "🦊 Basil's nose is twitching — something went wrong. Try again in a moment.")
+
+# ── Webhook ───────────────────────────────────────────────────────────────────
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -319,11 +420,10 @@ def webhook():
     phone   = from_wa.replace('whatsapp:', '')
     user    = get_user(phone)
 
-    # ── JOIN flow ─────────────────────────────────────────────────────────────
+    # ── JOIN ──────────────────────────────────────────────────────────────────
     if body.upper().startswith('JOIN'):
         parts = body.split(None, 1)
         code  = parts[1].upper().strip() if len(parts) > 1 else ''
-
         if user:
             send(from_wa, "🦊 You're already registered! Just send me a team name.")
         elif not code:
@@ -353,54 +453,62 @@ def webhook():
     if user.get('blocked'):
         return Response('', 204)
 
+    # ── Resolve pending disambiguation ────────────────────────────────────────
+    if body.strip() in ['1', '2', '3', '4', '5']:
+        pending = get_pending(phone)
+        if pending:
+            options = json.loads(pending.get('options', '[]'))
+            idx = int(body.strip()) - 1
+            if 0 <= idx < len(options):
+                clear_pending(phone)
+                body = options[idx]['query']
+                send(from_wa, "🦊 *On it...*")
+                t = threading.Thread(target=process_async, args=(from_wa, body, phone))
+                t.daemon = True
+                t.start()
+                return Response('', 204)
+
     # ── Rate limit ────────────────────────────────────────────────────────────
     if get_today_count(phone) >= DAILY_QUERY_LIMIT:
-        send(from_wa,
-             f"🦊 You've had {DAILY_QUERY_LIMIT} queries today — even foxes need a rest. "
-             f"Try again tomorrow.")
+        send(from_wa, f"🦊 You've had {DAILY_QUERY_LIMIT} queries today — even foxes need a rest. Try again tomorrow.")
         return Response('', 204)
 
-    # ── Gatekeeper — block off-topic before spending on search ───────────────
+    # ── Gatekeeper ────────────────────────────────────────────────────────────
     q = body.lower().strip()
     if q not in ['football', 'rugby', 'soccer']:
         intent = check_intent(body)
         if intent == 'offtopic':
-            reply = ("🦊 Basil's a sports fox, not a general assistant. "
-                     "Send me a team name and I'll tell you what channel they're on.")
             log_query(phone, body, 'BLOCKED:offtopic')
-            send(from_wa, reply)
+            send(from_wa, "🦊 Basil's a sports fox, not a general assistant. Send me a team name and I'll tell you what channel they're on.")
             return Response('', 204)
         if intent == 'unclear':
-            reply = (f"🦊 Not sure who you mean by *{body}* — "
-                     f"could you check the spelling or give me the full team name?")
             log_query(phone, body, 'BLOCKED:unclear')
-            send(from_wa, reply)
+            send(from_wa, f"🦊 Not sure who you mean by *{body}* — could you check the spelling or give me the full team name?")
             return Response('', 204)
 
-    # ── Process query ─────────────────────────────────────────────────────────
-    try:
-        if q in ['football', 'soccer']:
-            data  = basil_sport('football')
-            reply = fmt_sport(data)
-        elif q == 'rugby':
-            data  = basil_sport('rugby')
-            reply = fmt_sport(data)
-        else:
-            data = basil_team(body)
-            if data.get('clarify'):
-                reply = f"🦊 {data.get('message', 'Not sure who you mean — could you check the team name?')}"
-            else:
-                reply = fmt_team(data, body)
-    except Exception as ex:
-        print(f'ERROR processing "{body}": {ex}')
-        reply = ("🦊 Basil's nose is twitching — something went wrong. "
-                 "Try again in a moment.")
-
-    log_query(phone, body, reply)
-    send(from_wa, reply)
+    # ── Fire and forget ───────────────────────────────────────────────────────
+    send(from_wa, "🦊 *On it...*")
+    t = threading.Thread(target=process_async, args=(from_wa, body, phone))
+    t.daemon = True
+    t.start()
     return Response('', 204)
 
-# ── Admin auth ────────────────────────────────────────────────────────────────
+# ── 9am pre-fetch ─────────────────────────────────────────────────────────────
+
+def prefetch():
+    print("Pre-fetching today's matches...")
+    for sport in ['football', 'rugby']:
+        try:
+            data = basil_sport(sport)
+            print(f"Pre-fetched {sport}: {len(data.get('matches', []))} matches")
+        except Exception as e:
+            print(f"Pre-fetch error ({sport}): {e}")
+
+scheduler = BackgroundScheduler(timezone='Europe/London')
+scheduler.add_job(prefetch, 'cron', hour=9, minute=0)
+scheduler.start()
+
+# ── Admin ─────────────────────────────────────────────────────────────────────
 
 def auth_required(f):
     @wraps(f)
@@ -417,15 +525,13 @@ def admin_login():
         if request.form.get('password') == ADMIN_PASSWORD:
             session['admin'] = True
             return redirect('/admin')
-        err = 'Wrong password. Try again.'
+        err = 'Wrong password.'
     return render_template_string(LOGIN_HTML, err=err)
 
 @app.route('/admin/logout')
 def admin_logout():
     session.clear()
     return redirect('/admin/login')
-
-# ── Admin dashboard ───────────────────────────────────────────────────────────
 
 @app.route('/admin')
 @auth_required
@@ -444,28 +550,24 @@ def admin():
 @app.route('/admin/block', methods=['POST'])
 @auth_required
 def block_user():
-    phone = request.form.get('phone')
-    db.table('users').update({'blocked': True}).eq('phone_number', phone).execute()
+    db.table('users').update({'blocked': True}).eq('phone_number', request.form.get('phone')).execute()
     return redirect('/admin')
 
 @app.route('/admin/unblock', methods=['POST'])
 @auth_required
 def unblock_user():
-    phone = request.form.get('phone')
-    db.table('users').update({'blocked': False}).eq('phone_number', phone).execute()
+    db.table('users').update({'blocked': False}).eq('phone_number', request.form.get('phone')).execute()
     return redirect('/admin')
 
 @app.route('/admin/generate', methods=['POST'])
 @auth_required
 def generate_code():
-    code     = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    max_uses = int(request.form.get('max_uses', 1))
-    note     = request.form.get('note', '')
+    code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     db.table('invite_codes').insert({
         'code':       code,
-        'max_uses':   max_uses,
+        'max_uses':   int(request.form.get('max_uses', 1)),
         'uses_count': 0,
-        'note':       note,
+        'note':       request.form.get('note', ''),
         'created_at': datetime.utcnow().isoformat()
     }).execute()
     return redirect('/admin')
@@ -473,11 +575,16 @@ def generate_code():
 @app.route('/admin/delete-code', methods=['POST'])
 @auth_required
 def delete_code():
-    code = request.form.get('code')
-    db.table('invite_codes').delete().eq('code', code).execute()
+    db.table('invite_codes').delete().eq('code', request.form.get('code')).execute()
     return redirect('/admin')
 
-# ── HTML templates ────────────────────────────────────────────────────────────
+@app.route('/admin/prefetch', methods=['POST'])
+@auth_required
+def admin_prefetch():
+    threading.Thread(target=prefetch, daemon=True).start()
+    return redirect('/admin')
+
+# ── HTML ──────────────────────────────────────────────────────────────────────
 
 LOGIN_HTML = '''<!doctype html>
 <html>
@@ -522,12 +629,14 @@ ADMIN_HTML = '''<!doctype html>
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:system-ui,sans-serif;background:#f4f1eb;color:#222}
     header{background:#d4720a;color:white;padding:1rem 2rem;
-           display:flex;justify-content:space-between;align-items:center}
+           display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap}
     header h1{font-size:1.4rem}
+    header div{display:flex;gap:.75rem;align-items:center}
     header a{color:white;text-decoration:none;font-size:.85rem;opacity:.8}
+    .prefetch-btn{background:rgba(255,255,255,.2);color:white;border:none;
+                  padding:.4rem .9rem;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:600}
     .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;padding:1.5rem 2rem}
-    .stat{background:white;border-radius:10px;padding:1.25rem;
-          box-shadow:0 2px 8px rgba(0,0,0,.07)}
+    .stat{background:white;border-radius:10px;padding:1.25rem;box-shadow:0 2px 8px rgba(0,0,0,.07)}
     .stat .num{font-size:2rem;font-weight:700;color:#d4720a}
     .stat .lbl{font-size:.8rem;color:#888;margin-top:.2rem}
     .tabs{display:flex;gap:.5rem;padding:0 2rem;border-bottom:2px solid #e0d9cf}
@@ -558,45 +667,41 @@ ADMIN_HTML = '''<!doctype html>
                             font-size:.9rem;flex:1}
     .btn-primary{background:#d4720a;color:white;padding:.6rem 1.25rem;border:none;
                  border-radius:8px;cursor:pointer;font-weight:600;font-size:.9rem;white-space:nowrap}
-    .btn-primary:hover{background:#b85e08}
     .trunc{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .muted{color:#aaa;font-size:.8rem}
     .two-col{display:grid;grid-template-columns:1fr 2fr;gap:1.5rem;align-items:start}
   </style>
 </head>
 <body>
-
 <header>
   <h1>🦊 Basil Admin</h1>
-  <a href="/admin/logout">Sign out</a>
+  <div>
+    <form method="post" action="/admin/prefetch" style="display:inline">
+      <button class="prefetch-btn">↻ Pre-fetch today</button>
+    </form>
+    <a href="/admin/logout">Sign out</a>
+  </div>
 </header>
-
 <div class="stats">
   <div class="stat"><div class="num">{{ total_users }}</div><div class="lbl">Registered users</div></div>
   <div class="stat"><div class="num">{{ today_count }}</div><div class="lbl">Queries today</div></div>
   <div class="stat"><div class="num">{{ total_queries }}</div><div class="lbl">Total queries</div></div>
 </div>
-
 <div class="tabs">
   <div class="tab active" onclick="show('users',this)">Users ({{ total_users }})</div>
   <div class="tab" onclick="show('queries',this)">Query log</div>
   <div class="tab" onclick="show('codes',this)">Invite codes</div>
 </div>
-
-<!-- USERS -->
 <div id="users" class="panel active">
   <table>
-    <thead><tr><th>Phone</th><th>Code used</th><th>Registered</th><th>Status</th><th></th></tr></thead>
+    <thead><tr><th>Phone</th><th>Code</th><th>Registered</th><th>Status</th><th></th></tr></thead>
     <tbody>
     {% for u in users %}
     <tr>
       <td>{{ u.phone_number }}</td>
       <td><span class="badge code-badge">{{ u.invite_code }}</span></td>
       <td>{{ u.registered_at[:16].replace("T"," ") }}</td>
-      <td>
-        {% if u.blocked %}<span class="badge blocked">Blocked</span>
-        {% else %}<span class="badge ok">Active</span>{% endif %}
-      </td>
+      <td>{% if u.blocked %}<span class="badge blocked">Blocked</span>{% else %}<span class="badge ok">Active</span>{% endif %}</td>
       <td>
         {% if u.blocked %}
           <form method="post" action="/admin/unblock" style="display:inline">
@@ -617,8 +722,6 @@ ADMIN_HTML = '''<!doctype html>
     </tbody>
   </table>
 </div>
-
-<!-- QUERIES -->
 <div id="queries" class="panel">
   <table>
     <thead><tr><th>Time</th><th>Phone</th><th>Query</th><th>Response preview</th></tr></thead>
@@ -636,16 +739,12 @@ ADMIN_HTML = '''<!doctype html>
     </tbody>
   </table>
 </div>
-
-<!-- CODES -->
 <div id="codes" class="panel">
   <div class="two-col">
     <div class="card">
       <h3>Generate invite code</h3>
       <form method="post" action="/admin/generate">
-        <div class="row">
-          <input name="note" placeholder="Who's this for? (optional)">
-        </div>
+        <div class="row"><input name="note" placeholder="Who's this for? (optional)"></div>
         <div class="row">
           <select name="max_uses">
             <option value="1">1 use</option>
@@ -658,7 +757,6 @@ ADMIN_HTML = '''<!doctype html>
         </div>
       </form>
     </div>
-
     <table>
       <thead><tr><th>Code</th><th>Note</th><th>Uses</th><th></th></tr></thead>
       <tbody>
@@ -681,7 +779,6 @@ ADMIN_HTML = '''<!doctype html>
     </table>
   </div>
 </div>
-
 <script>
 function show(id, tab) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
