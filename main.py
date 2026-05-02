@@ -109,14 +109,33 @@ Return ONLY valid JSON — no markdown, no explanation, no backticks, nothing el
 def call_claude(prompt):
     response = claude.messages.create(
         model='claude-sonnet-4-20250514',
-        max_tokens=1000,
+        max_tokens=2000,
         messages=[{'role': 'user', 'content': prompt}],
         tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
     )
+
+    # Debug logging — visible in Railway logs
+    print(f"=== CLAUDE RESPONSE ===")
+    print(f"Stop reason: {response.stop_reason}")
+    print(f"Content blocks: {len(response.content)}")
+    for i, block in enumerate(response.content):
+        btype = getattr(block, 'type', 'unknown')
+        btext = getattr(block, 'text', '')[:300] if hasattr(block, 'text') else ''
+        print(f"  Block {i}: type={btype} | text={btext}")
+
+    # Extract all text blocks
     text = ''.join(b.text for b in response.content if getattr(b, 'type', '') == 'text')
+    print(f"Extracted text: '{text[:400]}'")
+
+    # Clean markdown fences if present
     text = re.sub(r'^```(?:json)?\s*', '', text.strip())
     text = re.sub(r'\s*```$', '', text)
-    return json.loads(text.strip())
+    text = text.strip()
+
+    if not text:
+        raise ValueError(f"Claude returned empty text. Stop reason: {response.stop_reason}")
+
+    return json.loads(text)
 
 def basil_team(query):
     today  = datetime.now().strftime('%A %d %B %Y')
