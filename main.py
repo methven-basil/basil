@@ -24,6 +24,7 @@ ANTHROPIC_API_KEY  = os.environ['ANTHROPIC_API_KEY']
 SUPABASE_URL       = os.environ['SUPABASE_URL']
 SUPABASE_KEY       = os.environ['SUPABASE_KEY']
 ADMIN_PASSWORD     = os.environ['ADMIN_PASSWORD']
+DAILY_QUERY_LIMIT  = int(os.environ.get('DAILY_QUERY_LIMIT', '20'))
 
 # ── Affiliate IDs (add after registering with each bookmaker) ─────────────────
 AFFILIATE_IDS = {
@@ -71,6 +72,44 @@ def log_query(phone, query, response):
         'queried_at':   datetime.utcnow().isoformat()
     }).execute()
 
+def get_today_count(phone):
+    """Count non-blocked queries this user has made today."""
+    today = date.today().isoformat()
+    r = db.table('queries').select('id')\
+        .eq('phone_number', phone)\
+        .gte('queried_at', today)\
+        .not_.like('response', 'BLOCKED%')\
+        .execute()
+    return len(r.data)
+
+# ── Gatekeeper (fast Haiku check before the expensive search) ─────────────────
+
+GATEKEEPER_PROMPT = """\
+You are a one-word classifier for a sports TV listings bot.
+
+The user sent: "{message}"
+
+Reply with ONLY one of these three words — nothing else:
+
+sport     — if this is clearly a sports team name, or the words football / rugby / soccer
+unclear   — if it might be a team name but you are not sure (odd spelling, abbreviation, etc.)
+offtopic  — if this is clearly not a sports team (gibberish, a question, general chat, etc.)"""
+
+def check_intent(message):
+    """Cheap Haiku gatekeeper — runs before the full web search call."""
+    try:
+        r = claude.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=5,
+            messages=[{'role': 'user', 'content': GATEKEEPER_PROMPT.format(message=message)}]
+        )
+        verdict = (r.content[0].text or '').strip().lower().split()[0]
+        print(f"Gatekeeper: '{message}' → {verdict}")
+        return verdict if verdict in ('sport', 'unclear', 'offtopic') else 'sport'
+    except Exception as e:
+        print(f"Gatekeeper error: {e}")
+        return 'sport'  # fail open
+
 # ── Claude prompts ────────────────────────────────────────────────────────────
 
 TEAM_PROMPT = """\
@@ -95,7 +134,10 @@ If playing TODAY use exactly this structure:
 {{"playing_today":true,"sport":"football","home_team":"","away_team":"","competition":"","venue":"","kickoff":"","coverage_start":"","tv_channel":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}
 
 If NOT playing today use exactly this structure:
-{{"playing_today":false,"sport":"football","home_team":"","away_team":"","competition":"","venue":"","next_date":"","kickoff":"","tv_channel":"","fox_fact":""}}"""
+{{"playing_today":false,"sport":"football","home_team":"","away_team":"","competition":"","venue":"","next_date":"","kickoff":"","tv_channel":"","fox_fact":""}}
+
+If you genuinely cannot identify the team at all, use exactly this structure:
+{{"clarify":true,"message":"Brief friendly message asking the user to check their spelling or give the full team name."}}"""
 
 SPORT_PROMPT = """\
 You are Basil — a sharp, witty fox who helps UK sports fans find what's on TV.
@@ -302,9 +344,32 @@ def webhook():
     if user.get('blocked'):
         return Response('', 204)
 
+    # ── Rate limit ────────────────────────────────────────────────────────────
+    if get_today_count(phone) >= DAILY_QUERY_LIMIT:
+        send(from_wa,
+             f"🦊 You've had {DAILY_QUERY_LIMIT} queries today — even foxes need a rest. "
+             f"Try again tomorrow.")
+        return Response('', 204)
+
+    # ── Gatekeeper — block off-topic before spending on search ───────────────
+    q = body.lower().strip()
+    if q not in ['football', 'rugby', 'soccer']:
+        intent = check_intent(body)
+        if intent == 'offtopic':
+            reply = ("🦊 Basil's a sports fox, not a general assistant. "
+                     "Send me a team name and I'll tell you what channel they're on.")
+            log_query(phone, body, 'BLOCKED:offtopic')
+            send(from_wa, reply)
+            return Response('', 204)
+        if intent == 'unclear':
+            reply = (f"🦊 Not sure who you mean by *{body}* — "
+                     f"could you check the spelling or give me the full team name?")
+            log_query(phone, body, 'BLOCKED:unclear')
+            send(from_wa, reply)
+            return Response('', 204)
+
     # ── Process query ─────────────────────────────────────────────────────────
     try:
-        q = body.lower().strip()
         if q in ['football', 'soccer']:
             data  = basil_sport('football')
             reply = fmt_sport(data)
@@ -312,8 +377,11 @@ def webhook():
             data  = basil_sport('rugby')
             reply = fmt_sport(data)
         else:
-            data  = basil_team(body)
-            reply = fmt_team(data)
+            data = basil_team(body)
+            if data.get('clarify'):
+                reply = f"🦊 {data.get('message', 'Not sure who you mean — could you check the team name?')}"
+            else:
+                reply = fmt_team(data)
     except Exception as ex:
         print(f'ERROR processing "{body}": {ex}')
         reply = ("🦊 Basil's nose is twitching — something went wrong. "
