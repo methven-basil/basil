@@ -4,6 +4,7 @@ import re
 import random
 import string
 import threading
+import time
 from datetime import datetime, date
 from functools import wraps
 
@@ -243,20 +244,38 @@ def extract_json(text):
 def call_claude(prompt):
     for attempt in range(2):
         p = prompt if attempt == 0 else prompt + STRICT_SUFFIX
-        try:
-            response = claude.messages.create(
-                model='claude-sonnet-4-6',
-                max_tokens=2000,
-                messages=[{'role': 'user', 'content': p}],
-                tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
-            )
-        except Exception as e:
-            print(f"Tool call failed ({e}), retrying without tools")
-            response = claude.messages.create(
-                model='claude-sonnet-4-6',
-                max_tokens=2000,
-                messages=[{'role': 'user', 'content': p}]
-            )
+
+        # Try up to 3 times on rate limit (30s apart)
+        for retry in range(3):
+            try:
+                try:
+                    response = claude.messages.create(
+                        model='claude-sonnet-4-6',
+                        max_tokens=2000,
+                        messages=[{'role': 'user', 'content': p}],
+                        tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
+                    )
+                except Exception as e:
+                    if 'web_search' in str(e).lower() or 'tool' in str(e).lower():
+                        print(f"Tool call failed, retrying without tools")
+                        response = claude.messages.create(
+                            model='claude-sonnet-4-6',
+                            max_tokens=2000,
+                            messages=[{'role': 'user', 'content': p}]
+                        )
+                    else:
+                        raise
+                break  # success — exit retry loop
+
+            except Exception as e:
+                if '429' in str(e) or 'rate_limit' in str(e).lower():
+                    wait = 30 * (retry + 1)
+                    print(f"Rate limited. Waiting {wait}s (retry {retry+1}/3)")
+                    time.sleep(wait)
+                    if retry == 2:
+                        raise
+                else:
+                    raise
 
         text = ''.join((getattr(b, 'text', '') or '')
                        for b in response.content if getattr(b, 'type', '') == 'text')
@@ -408,8 +427,12 @@ def process_async(from_wa, body, phone):
         send(from_wa, reply)
 
     except Exception as ex:
-        print(f'ERROR processing "{body}": {ex}')
-        send(from_wa, "🦊 Basil's nose is twitching — something went wrong. Try again in a moment.")
+        msg = str(ex)
+        print(f'ERROR processing "{body}": {msg}')
+        if '429' in msg or 'rate_limit' in msg.lower():
+            send(from_wa, "🦊 Basil's getting a lot of requests right now — give it a minute and try again.")
+        else:
+            send(from_wa, "🦊 Basil's nose is twitching — something went wrong. Try again in a moment.")
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 
