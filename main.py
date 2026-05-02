@@ -85,15 +85,19 @@ def get_today_count(phone):
 # ── Gatekeeper (fast Haiku check before the expensive search) ─────────────────
 
 GATEKEEPER_PROMPT = """\
-You are a one-word classifier for a sports TV listings bot.
+You are a one-word classifier for a UK sports TV listings bot.
 
 The user sent: "{message}"
 
+Sports teams often have short or place-based names like "Bath", "Hull", "Sale", "Wasps", \
+"Saints", "Blues", "Reds", "City", "United", "Rangers", "Celtic" etc. \
+Be generous — if there is any reasonable chance this could be a sports team name, say "sport".
+
 Reply with ONLY one of these three words — nothing else:
 
-sport     — if this is clearly a sports team name, or the words football / rugby / soccer
-unclear   — if it might be a team name but you are not sure (odd spelling, abbreviation, etc.)
-offtopic  — if this is clearly not a sports team (gibberish, a question, general chat, etc.)"""
+sport     — if this could plausibly be a sports team name or nickname, or the words football / rugby / soccer
+unclear   — if it is genuinely ambiguous and could not be a team (e.g. a partial sentence, random letters)
+offtopic  — if this is clearly not sports-related (a question, general chat, gibberish, instructions)"""
 
 def check_intent(message):
     """Cheap Haiku gatekeeper — runs before the full web search call."""
@@ -127,6 +131,10 @@ from a UK bookmaker (Paddy Power, Bet365, Sky Bet or William Hill).
 4. If NOT playing today: find their very next fixture — date, TV channel, kick-off time.
 5. Write a fox fact. Rules: genuinely surprising or funny, based on real fox behaviour, \
 under 60 words, ends with a one-liner that connects fox instinct to the idea of having a wager on this match.
+
+IMPORTANT — always report from the perspective of the team the user searched for.
+If the user searched "Bath Rugby" and Bath are the away team, still list Bath first as home_team \
+and their opponent as away_team. The user wants to know about THEIR team, not the host.
 
 Return ONLY valid JSON — no markdown, no explanation, no backticks, nothing else.
 
@@ -243,7 +251,7 @@ def affiliate_url(base_url, bookmaker):
 
 def sport_emoji(sport):
     return '🏉' if str(sport).lower() == 'rugby' else '⚽'
-def fmt_team(d):
+def fmt_team(d, body=''):
     e   = sport_emoji(d.get('sport', ''))
     url = affiliate_url(d.get('bookmaker_url', ''), d.get('bookmaker', ''))
 
@@ -271,13 +279,14 @@ def fmt_team(d):
             url,
         ]
     else:
+        searched = body  # original query from user
         lines = [
-            f"🦊 *{d['home_team']} aren't on TV today.*\n",
-            f"Next up: *{d['home_team']} vs {d['away_team']}*",
-            f"{d['competition']} | {d['venue']}",
-            f"📺 {d['tv_channel']} — {d['next_date']}, KO {d['kickoff']}\n",
+            f"🦊 *{d.get('home_team', searched)} aren't on TV today.*\n",
+            f"Next up: *{d.get('home_team', searched)} vs {d.get('away_team', 'TBC')}*",
+            f"{d.get('competition', '')} | {d.get('venue', '')}",
+            f"📺 {d.get('tv_channel', 'TBC')} — {d.get('next_date', 'TBC')}, KO {d.get('kickoff', 'TBC')}\n",
             "🦊 *Basil says:*",
-            d['fox_fact'],
+            d.get('fox_fact', ''),
         ]
 
     return '\n'.join(lines)
@@ -381,7 +390,7 @@ def webhook():
             if data.get('clarify'):
                 reply = f"🦊 {data.get('message', 'Not sure who you mean — could you check the team name?')}"
             else:
-                reply = fmt_team(data)
+                reply = fmt_team(data, body)
     except Exception as ex:
         print(f'ERROR processing "{body}": {ex}')
         reply = ("🦊 Basil's nose is twitching — something went wrong. "
