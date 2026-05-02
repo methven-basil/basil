@@ -201,7 +201,7 @@ If playing TODAY:
 {{"playing_today":true,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","kickoff":"","coverage_start":"","tv_channel":"","radio_station":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}
 
 If NOT playing today:
-{{"playing_today":false,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","next_date":"","kickoff":"","tv_channel":"","radio_station":"","fox_fact":""}}
+{{"playing_today":false,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","next_date":"","kickoff":"","tv_channel":"","radio_station":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}
 
 If AMBIGUOUS (multiple plausible matches from different sports/leagues):
 {{"ambiguous":true,"options":[{{"label":"Full Team Name (sport)","query":"Exact search term"}}]}}
@@ -428,6 +428,15 @@ def fmt_team(d, body=''):
             "🦊 *Basil says:*",
             d.get('fox_fact', ''),
         ]
+        if d.get('home_odds') and d.get('home_odds') not in ('', 'Unknown'):
+            url = make_bet_url(d.get('bookmaker_url', ''), d.get('bookmaker', 'Paddy Power'))
+            lines += [
+                '',
+                f"💰 *Early odds ({d.get('bookmaker', 'Paddy Power')})*",
+                f"{d.get('home_team','?')}: {d['home_odds']} | Draw: {d.get('draw_odds','')} | {d.get('away_team','?')}: {d.get('away_odds','')}\n",
+                "📲 *Want a flutter?*",
+                url,
+            ]
     return '\n'.join(lines)
 
 def fmt_sport(d):
