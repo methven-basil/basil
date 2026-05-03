@@ -389,6 +389,75 @@ def make_bet_url(base_url, bookmaker):
 def sport_emoji(sport):
     return '🏉' if str(sport).lower() == 'rugby' else '⚽'
 
+LEICESTER_FACTS = [
+    "In 2016, Leicester City won the Premier League at 5000/1. The biggest upset in football history. Orchestrated by foxes. Of course it was. I have never been more proud of anything in my life. Back them. Always back them. We're foxes.",
+    "In 2016, Leicester City won the Premier League at 5000/1. Every pundit said it was impossible. Every model said it was impossible. The foxes didn't get the memo. We never do.",
+    "In 2016, Leicester City won the Premier League at 5000/1. Ranieri celebrated with pizza. The players celebrated with each other. The foxes of England celebrated with something primal and ancient. We knew all along.",
+    "In 2016, Leicester City won the Premier League at 5000/1. Bookmakers lost millions. Dreamers won everything. It remains the greatest thing a fox has ever done. And foxes have done extraordinary things.",
+    "In 2016, Leicester City won the Premier League at 5000/1. I was there in spirit. Every fox was. It is the one result in football history that required no explanation if you understand how foxes think.",
+]
+
+LEICESTER_TRIGGERS = {'leicester', 'leicester city', 'the foxes', 'lcfc', 'leicester fc'}
+
+def is_leicester(body):
+    return body.lower().strip() in LEICESTER_TRIGGERS
+
+def fmt_leicester(d):
+    """Special Easter egg formatter for Leicester City."""
+    home = d.get('home_team', 'Leicester City')
+    away = d.get('away_team', '?')
+    fact = random.choice(LEICESTER_FACTS)
+
+    lines = [
+        "🦊 *Wait.*\n",
+        f"*Leicester City. The Foxes.*\n",
+        "*One of us.*\n",
+    ]
+
+    if d.get('playing_today'):
+        lines += [
+            f"⚽ *{home} vs {away}*",
+            f"{d.get('competition','')} | {d.get('venue','')}".strip(' |') + '\n',
+            f"📺 *{d.get('tv_channel','TBC')}*",
+        ]
+        cov = d.get('coverage_start')
+        lines.append(f"Coverage {cov} | KO {d.get('kickoff','TBC')}" if cov else f"KO {d.get('kickoff','TBC')}")
+        if d.get('radio_station'):
+            lines.append(f"📻 Also on {d['radio_station']}")
+        if d.get('home_odds') and d.get('home_odds') not in ('', 'Unknown'):
+            lines += [
+                '',
+                f"💰 *Odds ({d.get('bookmaker','Paddy Power')})*",
+                f"{home}: {d.get('home_odds','')} | Draw: {d.get('draw_odds','')} | {away}: {d.get('away_odds','')}\n",
+            ]
+    else:
+        next_date = d.get('next_date', 'TBC')
+        when = "Tomorrow" if next_date == "Tomorrow" else next_date
+        lines += [
+            f"⚽ *{home} vs {away}*",
+            f"{d.get('competition','')} | {d.get('venue','')}".strip(' |'),
+        ]
+        tv = d.get('tv_channel', '')
+        radio = d.get('radio_station', '')
+        if tv and tv.lower() not in ('', 'unknown', 'none'):
+            lines.append(f"📺 {tv} — {when}, KO {d.get('kickoff','TBC')}")
+        else:
+            lines.append(f"📺 Not yet confirmed — {when}, KO {d.get('kickoff','TBC')}")
+        if radio:
+            lines.append(f"📻 Also on {radio}")
+        if d.get('home_odds') and d.get('home_odds') not in ('', 'Unknown'):
+            lines += [
+                '',
+                f"💰 *Early odds ({d.get('bookmaker','Paddy Power')})*",
+                f"{home}: {d.get('home_odds','')} | Draw: {d.get('draw_odds','')} | {away}: {d.get('away_odds','')}\n",
+            ]
+
+    lines += [
+        "\n🦊 *Basil is beside himself:*",
+        fact,
+    ]
+    return '\n'.join(lines)
+
 def fmt_team(d, body=''):
     e   = sport_emoji(d.get('sport', ''))
     url = make_bet_url(d.get('bookmaker_url', ''), d.get('bookmaker', 'Paddy Power'))
@@ -487,6 +556,8 @@ def process_async(from_wa, body, phone):
                 reply = fmt_ambiguous(options, body)
             elif data.get('clarify'):
                 reply = f"🦊 {data.get('message', 'Not sure who you mean - could you check the team name?')}"
+            elif is_leicester(body):
+                reply = fmt_leicester(data)
             else:
                 reply = fmt_team(data, body)
 
