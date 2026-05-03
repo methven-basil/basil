@@ -175,37 +175,30 @@ def check_intent(message):
 # ── Claude prompts ────────────────────────────────────────────────────────────
 
 TEAM_PROMPT = """\
+IMPORTANT: You must respond with ONLY a valid JSON object. No narrative, no explanation, \
+no markdown. Your entire response must be parseable JSON starting with {{ and ending with }}.
+
 You are Basil - a sharp, witty fox who helps UK sports fans find their team on TV.
 
 Today is {today}.
 
 The user has sent: "{query}"
 
-Your tasks:
-1. Work out if this is a football or rugby union team (use common sense).
+Tasks:
+1. Work out if this is a football or rugby union team.
 2. Search wheresthematch.com to find whether they are playing TODAY or TOMORROW.
-3. If playing today or tomorrow: get the UK TV channel, kick-off time, coverage start time, and current odds \
-from a UK bookmaker (Paddy Power, Bet365 or William Hill).
-4. If NOT playing today or tomorrow: find their very next fixture - date, TV channel, kick-off time.
-5. For both cases: check if the match is also on UK radio (BBC Radio 5 Live, talkSPORT, \
-BBC Radio Scotland, BBC Radio Wales, BBC Radio Ulster). Only include radio if you are confident \
-it is being broadcast. Leave radio_station blank if unsure - do not guess.
-6. Write a fox fact: genuinely surprising, based on real fox behaviour, under 60 words, \
-ends with a one-liner connecting fox instinct to having a wager on this match.
+3. If playing today or tomorrow: get the UK TV channel, kick-off time, coverage start, \
+and current odds from Paddy Power, Bet365 or William Hill.
+4. If NOT playing today or tomorrow: find their very next fixture.
+5. Check for UK radio coverage (BBC Radio 5 Live, talkSPORT, BBC Radio Scotland etc). \
+Only include if confident - leave blank if unsure.
+6. Write a fox fact: real fox behaviour, under 60 words, ends with a dry one-liner \
+connecting fox instinct to having a wager on this match.
 
-IMPORTANT - always report from the perspective of the team the user searched for.
-Always show the searched team first, then their opponent. Make clear in the venue field \
-whether the searched team is home or away (e.g. "Away at Stade Atlantique, Bordeaux" if away).
-
-IMPORTANT - if the match is TODAY, set playing_today to true.
-If the match is TOMORROW or within 24 hours, still set playing_today to false but set \
-next_date to "Tomorrow" rather than the full date.
-
-IMPORTANT - if multiple very different teams could match this name (e.g. "Saints" = Southampton FC,
-Northampton Saints rugby, St Mirren FC), return the ambiguous response instead.
-Only use ambiguous if teams are from genuinely different sports or leagues - don't overthink it.
-
-Return ONLY valid JSON - no markdown, no explanation, no backticks.
+Always report from the searched team's perspective. Show them first.
+If match is TOMORROW, set next_date to "Tomorrow".
+If multiple very different teams match (e.g. Saints = Southampton OR Northampton Saints), \
+use the ambiguous response.
 
 If playing TODAY:
 {{"playing_today":true,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","kickoff":"","coverage_start":"","tv_channel":"","radio_station":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}
@@ -213,11 +206,13 @@ If playing TODAY:
 If NOT playing today:
 {{"playing_today":false,"sport":"rugby","home_team":"","away_team":"","competition":"","venue":"","next_date":"","kickoff":"","tv_channel":"","radio_station":"","home_odds":"","draw_odds":"","away_odds":"","bookmaker":"","bookmaker_url":"","fox_fact":""}}
 
-If AMBIGUOUS (multiple plausible matches from different sports/leagues):
+If AMBIGUOUS:
 {{"ambiguous":true,"options":[{{"label":"Full Team Name (sport)","query":"Exact search term"}}]}}
 
-If team cannot be identified at all:
-{{"clarify":true,"message":"Short friendly message asking user to check spelling."}}"""
+If unknown:
+{{"clarify":true,"message":"Short friendly message."}}
+
+Remember: respond with ONLY the JSON object."""
 
 SPORT_PROMPT = """\
 You are Basil - a sharp, witty fox who helps UK sports fans find what's on TV.
@@ -338,41 +333,45 @@ def call_claude(prompt):
 
 def basil_team(query):
     """
-    New orchestrated approach:
+    Orchestrated approach:
     1. Check cache
     2. Try data APIs (fixture + odds + TV scrape + fox fact via Haiku)
-    3. Fall back to Claude web search if APIs fail - alert admin
+    3. Fall back to Claude web search if APIs fail (expected for many teams)
+    4. Alert admin only if Claude also fails
     """
     cached = get_cache(query)
     if cached:
         return cached
 
-    # Import data layer
+    # Try data layer first
     try:
         from data_layer import get_match_data
         result = get_match_data(query)
         if result:
-            # If TV channel is missing, try a targeted Claude call for just the TV info
             if not result.get('tv_channel'):
                 result['tv_channel'] = get_tv_channel_claude(
                     result.get('home_team', query),
                     result.get('away_team', ''),
                     result.get('sport', 'football')
                 )
-            if result and not result.get('ambiguous') and not result.get('clarify'):
+            if not result.get('ambiguous') and not result.get('clarify'):
                 set_cache(query, result)
             return result
     except Exception as e:
         print(f"Data layer error for '{query}': {e}")
-        alert_admin(f"Data layer failed for '{query}': {e}. Falling back to Claude web search.")
 
-    # Fallback: Claude with web search (expensive - alert admin)
-    alert_admin(f"Using Claude web search fallback for: {query}")
-    today  = datetime.now().strftime('%A %d %B %Y')
-    result = call_claude(TEAM_PROMPT.format(today=today, query=query))
-    if result and not result.get('ambiguous') and not result.get('clarify'):
-        set_cache(query, result)
-    return result
+    # Fallback to Claude web search (common - no alert needed)
+    print(f"Claude web search fallback for: {query}")
+    try:
+        today  = datetime.now().strftime('%A %d %B %Y')
+        result = call_claude(TEAM_PROMPT.format(today=today, query=query))
+        if result and not result.get('ambiguous') and not result.get('clarify'):
+            set_cache(query, result)
+        return result
+    except Exception as e:
+        # Only alert admin when EVERYTHING fails
+        alert_admin(f"Complete failure for '{query}': {e}")
+        raise
 
 def basil_sport(sport):
     cached = get_cache(sport)
