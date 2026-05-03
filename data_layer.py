@@ -232,31 +232,30 @@ def _name_variants(name):
 # ── Step 2: Get fixtures ───────────────────────────────────────────────────────
 
 def get_football_fixture(team_id, team_name):
-    """
-    Try today's fixture first, then next upcoming.
-    Returns fixture dict or None.
-    """
+    """Try today's fixture first, then next upcoming."""
     today = date.today().isoformat()
     try:
-        # Try today
         resp = requests.get(
             f'{FOOTBALL_BASE}/fixtures',
             headers=HEADERS,
             params={'team': team_id, 'date': today, 'timezone': 'Europe/London'},
             timeout=8
         )
-        fixtures = resp.json().get('response', [])
+        data = resp.json()
+        print(f"Football fixture today: status={resp.status_code} results={data.get('results',0)} errors={data.get('errors',{})}")
+        fixtures = data.get('response', [])
         if fixtures:
             return _parse_football_fixture(fixtures[0], playing_today=True)
 
-        # Try next fixture
         resp2 = requests.get(
             f'{FOOTBALL_BASE}/fixtures',
             headers=HEADERS,
             params={'team': team_id, 'next': 1, 'timezone': 'Europe/London'},
             timeout=8
         )
-        fixtures2 = resp2.json().get('response', [])
+        data2 = resp2.json()
+        print(f"Football fixture next: status={resp2.status_code} results={data2.get('results',0)} errors={data2.get('errors',{})}")
+        fixtures2 = data2.get('response', [])
         if fixtures2:
             return _parse_football_fixture(fixtures2[0], playing_today=False)
 
