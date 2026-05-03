@@ -333,35 +333,16 @@ def call_claude(prompt):
 
 def basil_team(query):
     """
-    Orchestrated approach:
-    1. Check cache
-    2. Try data APIs (fixture + odds + TV scrape + fox fact via Haiku)
-    3. Fall back to Claude web search if APIs fail (expected for many teams)
-    4. Alert admin only if Claude also fails
+    Claude web search is the primary path.
+    API-Football/Rugby suspended — reverting to API-first once restored.
+    To switch back: uncomment the data layer block and remove this note.
     """
     cached = get_cache(query)
     if cached:
         return cached
 
-    # Try data layer first
-    try:
-        from data_layer import get_match_data
-        result = get_match_data(query)
-        if result:
-            if not result.get('tv_channel'):
-                result['tv_channel'] = get_tv_channel_claude(
-                    result.get('home_team', query),
-                    result.get('away_team', ''),
-                    result.get('sport', 'football')
-                )
-            if not result.get('ambiguous') and not result.get('clarify'):
-                set_cache(query, result)
-            return result
-    except Exception as e:
-        print(f"Data layer error for '{query}': {e}")
-
-    # Fallback to Claude web search (common - no alert needed)
-    print(f"Claude web search fallback for: {query}")
+    # Primary: Claude web search
+    print(f"Claude web search for: {query}")
     try:
         today  = datetime.now().strftime('%A %d %B %Y')
         result = call_claude(TEAM_PROMPT.format(today=today, query=query))
@@ -369,7 +350,6 @@ def basil_team(query):
             set_cache(query, result)
         return result
     except Exception as e:
-        # Only alert admin when EVERYTHING fails
         alert_admin(f"Complete failure for '{query}': {e}")
         raise
 
@@ -758,16 +738,18 @@ def prefetch():
             print(f"Error caching {sport} overview: {e}")
         time.sleep(2)
 
-    # Batch fetch all league fixtures via API (no Claude web search)
-    try:
-        from data_layer import prefetch_all_leagues
-        all_matches = prefetch_all_leagues()
-        for team, match in all_matches.items():
-            set_cache(team, match)
-        print(f"=== PRE-FETCH COMPLETE: {len(all_matches)} teams cached ===")
-    except Exception as e:
-        print(f"Batch prefetch error: {e}")
-        alert_admin(f"Morning prefetch failed: {e}")
+    # Batch fetch disabled while API-Football is suspended.
+    # To re-enable: restore the block below and remove this note.
+    # try:
+    #     from data_layer import prefetch_all_leagues
+    #     all_matches = prefetch_all_leagues()
+    #     for team, match in all_matches.items():
+    #         set_cache(team, match)
+    #     print(f"=== PRE-FETCH COMPLETE: {len(all_matches)} teams cached ===")
+    # except Exception as e:
+    #     print(f"Batch prefetch error: {e}")
+    #     alert_admin(f"Morning prefetch failed: {e}")
+    print("=== PRE-FETCH COMPLETE: API batch disabled (API-Football suspended) ===")
 
 scheduler = BackgroundScheduler(timezone='Europe/London')
 scheduler.add_job(prefetch, 'cron', hour=9, minute=0)
