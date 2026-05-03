@@ -546,7 +546,7 @@ def fmt_team(d, body=''):
             d.get('fox_fact', ''),
         ]
     else:
-        searched = d.get('home_team', body)
+        searched = body.strip().title() if body.strip() else d.get('home_team', '?')
         next_date = d.get('next_date', 'TBC')
         when = "Tomorrow" if next_date == "Tomorrow" else next_date
         lines = [
