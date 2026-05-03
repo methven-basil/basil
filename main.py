@@ -293,14 +293,16 @@ def call_claude(prompt):
     for attempt in range(2):
         p = prompt if attempt == 0 else prompt + STRICT_SUFFIX
 
-        # Try up to 3 times on rate limit (30s apart)
         for retry in range(3):
             try:
                 try:
                     response = claude.messages.create(
                         model='claude-sonnet-4-6',
                         max_tokens=2000,
-                        messages=[{'role': 'user', 'content': p}],
+                        messages=[
+                            {'role': 'user',      'content': p},
+                            {'role': 'assistant', 'content': '{'},  # JSON prefill
+                        ],
                         tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
                     )
                 except Exception as e:
@@ -309,12 +311,14 @@ def call_claude(prompt):
                         response = claude.messages.create(
                             model='claude-sonnet-4-6',
                             max_tokens=2000,
-                            messages=[{'role': 'user', 'content': p}]
+                            messages=[
+                                {'role': 'user',      'content': p},
+                                {'role': 'assistant', 'content': '{'},
+                            ]
                         )
                     else:
                         raise
-                break  # success - exit retry loop
-
+                break
             except Exception as e:
                 if '429' in str(e) or 'rate_limit' in str(e).lower():
                     wait = 30 * (retry + 1)
@@ -325,7 +329,8 @@ def call_claude(prompt):
                 else:
                     raise
 
-        text = ''.join((getattr(b, 'text', '') or '')
+        # Response already starts with { due to prefill - prepend it back
+        text = '{' + ''.join((getattr(b, 'text', '') or '')
                        for b in response.content if getattr(b, 'type', '') == 'text')
         text = re.sub(r'^```(?:json)?\s*', '', text.strip())
         text = re.sub(r'\s*```$', '', text).strip()
