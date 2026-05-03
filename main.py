@@ -299,10 +299,7 @@ def call_claude(prompt):
                     response = claude.messages.create(
                         model='claude-sonnet-4-6',
                         max_tokens=2000,
-                        messages=[
-                            {'role': 'user',      'content': p},
-                            {'role': 'assistant', 'content': '{'},  # JSON prefill
-                        ],
+                        messages=[{'role': 'user', 'content': p}],
                         tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
                     )
                 except Exception as e:
@@ -311,10 +308,7 @@ def call_claude(prompt):
                         response = claude.messages.create(
                             model='claude-sonnet-4-6',
                             max_tokens=2000,
-                            messages=[
-                                {'role': 'user',      'content': p},
-                                {'role': 'assistant', 'content': '{'},
-                            ]
+                            messages=[{'role': 'user', 'content': p}]
                         )
                     else:
                         raise
@@ -329,8 +323,7 @@ def call_claude(prompt):
                 else:
                     raise
 
-        # Response already starts with { due to prefill - prepend it back
-        text = '{' + ''.join((getattr(b, 'text', '') or '')
+        text = ''.join((getattr(b, 'text', '') or '')
                        for b in response.content if getattr(b, 'type', '') == 'text')
         text = re.sub(r'^```(?:json)?\s*', '', text.strip())
         text = re.sub(r'\s*```$', '', text).strip()
