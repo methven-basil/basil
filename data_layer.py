@@ -126,25 +126,11 @@ KNOWN_FOOTBALL_IDS = {
 }
 
 KNOWN_RUGBY_IDS = {
-    'leinster': 1, 'munster': 2, 'ulster': 3, 'connacht': 4,
-    'edinburgh': 5, 'glasgow warriors': 6, 'glasgow': 6,
-    'cardiff': 7, 'dragons': 8, 'scarlets': 9, 'ospreys': 10,
-    'stormers': 11, 'sharks': 12, 'bulls': 13, 'lions': 14,
-    'zebre': 16, 'benetton': 17,
-    'bath': 18, 'bath rugby': 18,
-    'bristol bears': 19, 'bristol': 19,
-    'exeter': 20, 'exeter chiefs': 20,
-    'gloucester': 21, 'harlequins': 22, 'quins': 22,
-    'leicester tigers': 23, 'tigers': 23,
-    'northampton': 25, 'northampton saints': 25,
-    'sale sharks': 26, 'sale': 26,
-    'saracens': 27, 'sarries': 27,
-    'toulon': 30, 'rc toulon': 30,
-    'la rochelle': 31, 'clermont': 32,
-    'toulouse': 33, 'stade toulousain': 33,
-    'bordeaux': 34, 'union bordeaux begles': 34,
-    'racing 92': 35, 'racing': 35,
+    # These IDs need verification against api-rugby.com dashboard
+    # Leave mostly empty until confirmed - better to fall through to Claude
+    # than to use wrong IDs that return no results
 }
+
 
 def _lookup_known_id(team_name, sport):
     key = team_name.lower().strip()
