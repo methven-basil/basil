@@ -6,6 +6,7 @@ import random
 import string
 import threading
 import time
+import requests
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
 from functools import wraps
@@ -31,6 +32,9 @@ SUPABASE_KEY       = os.environ['SUPABASE_KEY']
 ADMIN_PASSWORD     = os.environ['ADMIN_PASSWORD']
 DAILY_QUERY_LIMIT  = int(os.environ.get('DAILY_QUERY_LIMIT', '20'))
 RAILWAY_HOST       = os.environ.get('RAILWAY_PUBLIC_DOMAIN', '')
+ADMIN_PHONE        = os.environ.get('ADMIN_PHONE', '')   # e.g. whatsapp:+447808635514
+APISPORTS_KEY      = os.environ.get('APISPORTS_KEY', '')
+ODDS_API_KEY       = os.environ.get('ODDS_API_KEY', '')
 
 # ── Affiliate IDs ─────────────────────────────────────────────────────────────
 AFFILIATE_IDS = {
@@ -335,9 +339,37 @@ def call_claude(prompt):
     raise ValueError("Could not extract valid JSON after 2 attempts")
 
 def basil_team(query):
+    """
+    New orchestrated approach:
+    1. Check cache
+    2. Try data APIs (fixture + odds + TV scrape + fox fact via Haiku)
+    3. Fall back to Claude web search if APIs fail - alert admin
+    """
     cached = get_cache(query)
     if cached:
         return cached
+
+    # Import data layer
+    try:
+        from data_layer import get_match_data
+        result = get_match_data(query)
+        if result:
+            # If TV channel is missing, try a targeted Claude call for just the TV info
+            if not result.get('tv_channel'):
+                result['tv_channel'] = get_tv_channel_claude(
+                    result.get('home_team', query),
+                    result.get('away_team', ''),
+                    result.get('sport', 'football')
+                )
+            if result and not result.get('ambiguous') and not result.get('clarify'):
+                set_cache(query, result)
+            return result
+    except Exception as e:
+        print(f"Data layer error for '{query}': {e}")
+        alert_admin(f"Data layer failed for '{query}': {e}. Falling back to Claude web search.")
+
+    # Fallback: Claude with web search (expensive - alert admin)
+    alert_admin(f"Using Claude web search fallback for: {query}")
     today  = datetime.now().strftime('%A %d %B %Y')
     result = call_claude(TEAM_PROMPT.format(today=today, query=query))
     if result and not result.get('ambiguous') and not result.get('clarify'):
@@ -353,6 +385,59 @@ def basil_sport(sport):
     if result:
         set_cache(sport, result)
     return result
+
+# ── TV channel targeted lookup (mini Claude call, no web search) ───────────────
+
+TV_CHANNEL_PROMPT = """\
+What UK TV channel is showing {home_team} vs {away_team} ({sport}) today?
+Search wheresthematch.com for the answer.
+Reply with ONLY the channel name (e.g. "Sky Sports Football", "Premier Sports 1", "TNT Sports 1").
+If not on UK TV today, reply with exactly: none"""
+
+def get_tv_channel_claude(home, away, sport):
+    """Targeted Claude call with web search just to find TV channel. Much cheaper than full query."""
+    try:
+        resp = claude.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=30,
+            messages=[{'role': 'user', 'content': TV_CHANNEL_PROMPT.format(
+                home_team=home, away_team=away, sport=sport
+            )}],
+            tools=[{'type': 'web_search_20250305', 'name': 'web_search'}]
+        )
+        text = ''.join((getattr(b, 'text', '') or '') for b in resp.content
+                       if getattr(b, 'type', '') == 'text').strip()
+        if text.lower() == 'none' or not text:
+            return ''
+        return text
+    except Exception as e:
+        print(f"TV channel lookup error: {e}")
+        return ''
+
+# ── Admin alerting ────────────────────────────────────────────────────────────
+
+_last_alert_time = {}
+ALERT_COOLDOWN = 3600  # 1 hour between same-type alerts
+
+def alert_admin(message):
+    """Send WhatsApp alert to admin. Rate-limited to avoid spam."""
+    global _last_alert_time
+    now = time.time()
+    key = message[:50]
+    if now - _last_alert_time.get(key, 0) < ALERT_COOLDOWN:
+        print(f"Alert suppressed (cooldown): {message}")
+        return
+    _last_alert_time[key] = now
+    print(f"ADMIN ALERT: {message}")
+    if ADMIN_PHONE:
+        try:
+            twilio.messages.create(
+                from_=TWILIO_FROM,
+                to=ADMIN_PHONE,
+                body=f"🦊 Basil alert:\n{message}"
+            )
+        except Exception as e:
+            print(f"Alert send failed: {e}")
 
 # ── Bookmaker redirect (prevents WhatsApp link preview + tracks clicks) ───────
 
@@ -567,6 +652,7 @@ def process_async(from_wa, body, phone):
     except Exception as ex:
         msg = str(ex)
         print(f'ERROR processing "{body}": {msg}')
+        alert_admin(f"Query failed: '{body}' - {msg[:200]}")
         if '429' in msg or 'rate_limit' in msg.lower():
             send(from_wa, "🦊 Basil's getting a lot of requests right now - give it a minute and try again.")
         else:
@@ -984,6 +1070,20 @@ function show(id, tab) {
 </script>
 </body>
 </html>'''
+
+@app.route('/health')
+def health():
+    """Health check endpoint - useful for monitoring."""
+    try:
+        from data_layer import APISPORTS_KEY, ODDS_API_KEY
+        return {
+            'status': 'ok',
+            'api_football': 'configured' if APISPORTS_KEY else 'missing',
+            'odds_api':     'configured' if ODDS_API_KEY else 'missing',
+            'admin_phone':  'configured' if ADMIN_PHONE else 'missing',
+        }
+    except Exception as e:
+        return {'status': 'error', 'detail': str(e)}, 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
