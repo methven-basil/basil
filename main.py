@@ -396,18 +396,21 @@ def fmt_team(d, body=''):
     if d.get('playing_today'):
         lines = [
             "🦊 *Basil's tip for today...*\n",
-            f"{e} *{d['home_team']} vs {d['away_team']}*",
-            f"{d['competition']} | {d['venue']}\n",
-            f"📺 *{d['tv_channel']}*",
+            f"{e} *{d.get('home_team','?')} vs {d.get('away_team','?')}*",
+            f"{d.get('competition','')} | {d.get('venue','')}".strip(' |') + '\n',
+            f"📺 *{d.get('tv_channel','TBC')}*",
         ]
         cov = d.get('coverage_start')
-        lines.append(f"Coverage {cov} | KO {d['kickoff']}" if cov else f"KO {d['kickoff']}")
+        lines.append(f"Coverage {cov} | KO {d.get('kickoff','TBC')}" if cov else f"KO {d.get('kickoff','TBC')}")
         if d.get('radio_station'):
             lines.append(f"📻 Also on {d['radio_station']}")
+        if d.get('home_odds') and d.get('home_odds') not in ('', 'Unknown'):
+            lines += [
+                '',
+                f"💰 *Odds ({d.get('bookmaker','Paddy Power')})*",
+                f"{d.get('home_team','?')}: {d.get('home_odds','')} | Draw: {d.get('draw_odds','')} | {d.get('away_team','?')}: {d.get('away_odds','')}\n",
+            ]
         lines += [
-            '',
-            f"💰 *Odds ({d['bookmaker']})*",
-            f"{d['home_team']}: {d['home_odds']} | Draw: {d['draw_odds']} | {d['away_team']}: {d['away_odds']}\n",
             "🦊 *Basil says:*",
             d.get('fox_fact', ''),
             '',
@@ -603,6 +606,7 @@ def prefetch_competition(competition, sport, today):
             return
         for match in matches:
             match['playing_today'] = True
+            match['competition'] = competition
             for team_field in ['home_team', 'away_team']:
                 team = (match.get(team_field) or '').strip()
                 if team:
@@ -921,3 +925,4 @@ function show(id, tab) {
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
