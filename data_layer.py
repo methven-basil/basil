@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Basil data layer - replaces Claude web search with dedicated APIs.
+Basil data layer - dedicated sports APIs replace Claude web search.
 
-Priority chain per query:
-  Fixtures : API-Football / API-Rugby  →  WheresTheMatch scrape  →  Claude web search
-  Odds     : The Odds API              →  API-Football odds      →  Claude web search
-  TV       : WheresTheMatch scrape     →  Claude web search
-  Fox fact : Claude Sonnet (NO web search, tiny prompt)
+Priority chain:
+  Fixtures : API-Football/Rugby (2-step: team ID -> fixture) -> Claude web search fallback
+  Odds     : The Odds API (search all relevant sport keys)   -> Claude web search fallback
+  TV       : WheresTheMatch scrape                           -> Claude targeted Haiku call
+  Fox fact : Claude Haiku, NO web search (~300 tokens)
 
-Cost reduction: ~85-90% vs previous all-Claude-web-search approach.
+Cost vs old approach: ~95% reduction in tokens/web searches.
 """
 
 import os
@@ -16,236 +16,271 @@ import re
 import json
 import time
 import requests
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from fractions import Fraction
 
-# ── API credentials ──────────────────────────────────────────────────────────
+# ── Credentials ───────────────────────────────────────────────────────────────
 
-APISPORTS_KEY = os.environ.get('APISPORTS_KEY', '')   # API-Football + API-Rugby
-ODDS_API_KEY  = os.environ.get('ODDS_API_KEY', '')    # The Odds API
+APISPORTS_KEY = os.environ.get('APISPORTS_KEY', '')
+ODDS_API_KEY  = os.environ.get('ODDS_API_KEY', '')
 
 FOOTBALL_BASE = 'https://v3.football.api-sports.io'
 RUGBY_BASE    = 'https://v1.rugby.api-sports.io'
 ODDS_BASE     = 'https://api.the-odds-api.com/v4'
+HEADERS       = {'x-apisports-key': APISPORTS_KEY}
 
-APISPORTS_HEADERS = {'x-apisports-key': APISPORTS_KEY}
-
-# ── Odds API sport keys for UK-relevant competitions ─────────────────────────
-
+# Odds API sport keys to check for UK-relevant competitions
 FOOTBALL_SPORT_KEYS = [
-    'soccer_epl',
-    'soccer_scotland_premiership',
-    'soccer_uefa_champs_league',
-    'soccer_fa_cup',
-    'soccer_scotland_fa_cup',
+    'soccer_epl', 'soccer_scotland_premiership', 'soccer_uefa_champs_league',
+    'soccer_fa_cup', 'soccer_scotland_fa_cup', 'soccer_england_league1',
+    'soccer_england_league2', 'soccer_spain_la_liga', 'soccer_italy_serie_a',
+    'soccer_germany_bundesliga', 'soccer_france_ligue_one',
 ]
-
 RUGBY_SPORT_KEYS = [
-    'rugbyunion_premiership',
-    'rugbyunion_united_rugby_championship',
-    'rugbyunion_champions_cup',
-    'rugbyunion_challenge_cup',
-    'rugbyunion_six_nations',
-    'rugbyunion_super_rugby',
-    'rugbyunion_world_cup',
+    'rugbyunion_premiership', 'rugbyunion_united_rugby_championship',
+    'rugbyunion_champions_cup', 'rugbyunion_challenge_cup',
+    'rugbyunion_six_nations', 'rugbyunion_super_rugby', 'rugbyunion_world_cup',
 ]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def decimal_to_fractional(d):
-    """Convert decimal odds (e.g. 4.0) to fractional string (e.g. 3/1)."""
+    """Convert decimal odds (4.0) to fractional string (3/1)."""
     try:
         d = float(d)
         if d <= 1:
             return 'N/A'
-        if abs(d - 2.0) < 0.01:
+        if abs(d - 2.0) < 0.05:
             return 'Evs'
         frac = Fraction(d - 1).limit_denominator(20)
         return f"{frac.numerator}/{frac.denominator}"
     except Exception:
         return str(d)
 
-def today_str():
-    return date.today().isoformat()
+def fmt_kickoff(dt_str):
+    """Extract HH:MM from ISO datetime string."""
+    if not dt_str:
+        return ''
+    try:
+        # Handle both '2026-05-05T19:45:00+01:00' and '2026-05-05T19:45:00'
+        return dt_str[11:16]
+    except Exception:
+        return ''
 
-def team_matches(name, fixture):
-    """Check if team name loosely matches a fixture team."""
-    name = name.lower().strip()
-    home = (fixture.get('home_team') or '').lower()
-    away = (fixture.get('away_team') or '').lower()
-    return name in home or name in away or home in name or away in name
+def fmt_date(dt_str):
+    """Return 'Tomorrow' or formatted date string."""
+    if not dt_str:
+        return 'TBC'
+    try:
+        d = dt_str[:10]
+        today    = date.today().isoformat()
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+        if d == today:
+            return 'Today'
+        if d == tomorrow:
+            return 'Tomorrow'
+        # Format as 'Saturday 9 May 2026'
+        dt = datetime.strptime(d, '%Y-%m-%d')
+        return dt.strftime('%A %d %B %Y')
+    except Exception:
+        return dt_str[:10]
 
-# ── API-Football ──────────────────────────────────────────────────────────────
+def name_matches(search, candidate):
+    """Fuzzy team name match."""
+    s = search.lower().strip()
+    c = candidate.lower().strip()
+    return s in c or c in s or s[:6] in c
 
-def api_football_fixtures(team_name):
-    """Search today's football fixtures by team name. Returns list of fixture dicts."""
-    if not APISPORTS_KEY:
-        return []
+# ── Step 1: Get team ID ────────────────────────────────────────────────────────
+
+def get_football_team_id(team_name):
+    """Look up API-Football team ID by name. Returns int or None."""
     try:
         resp = requests.get(
-            f'{FOOTBALL_BASE}/fixtures',
-            headers=APISPORTS_HEADERS,
-            params={'date': today_str(), 'timezone': 'Europe/London'},
+            f'{FOOTBALL_BASE}/teams',
+            headers=HEADERS,
+            params={'search': team_name},
             timeout=8
         )
-        data = resp.json()
-        results = []
-        for item in data.get('response', []):
-            teams = item.get('teams', {})
-            home  = teams.get('home', {}).get('name', '')
-            away  = teams.get('away', {}).get('name', '')
-            name_lower = team_name.lower()
-            if name_lower in home.lower() or name_lower in away.lower():
-                fixture = item.get('fixture', {})
-                league  = item.get('league', {})
-                venue   = item.get('fixture', {}).get('venue', {})
-                results.append({
-                    'fixture_id':  fixture.get('id'),
-                    'home_team':   home,
-                    'away_team':   away,
-                    'competition': league.get('name', ''),
-                    'venue':       venue.get('name', '') if isinstance(venue, dict) else '',
-                    'kickoff':     fixture.get('date', '')[:16].replace('T', ' ')[11:16],
-                    'sport':       'football',
-                    'playing_today': True,
-                })
-        # If not today, try next fixture
-        if not results:
-            resp2 = requests.get(
-                f'{FOOTBALL_BASE}/fixtures',
-                headers=APISPORTS_HEADERS,
-                params={'search': team_name, 'next': 1, 'timezone': 'Europe/London'},
-                timeout=8
-            )
-            for item in resp2.json().get('response', []):
-                teams = item.get('teams', {})
-                home  = teams.get('home', {}).get('name', '')
-                away  = teams.get('away', {}).get('name', '')
-                fixture = item.get('fixture', {})
-                league  = item.get('league', {})
-                venue   = item.get('fixture', {}).get('venue', {})
-                dt = fixture.get('date', '')
-                next_date = 'Tomorrow' if dt[:10] == (date.today().isoformat()[:10]) else dt[:10]
-                results.append({
-                    'fixture_id':  fixture.get('id'),
-                    'home_team':   home,
-                    'away_team':   away,
-                    'competition': league.get('name', ''),
-                    'venue':       venue.get('name', '') if isinstance(venue, dict) else '',
-                    'kickoff':     dt[11:16] if len(dt) > 11 else '',
-                    'next_date':   next_date,
-                    'sport':       'football',
-                    'playing_today': False,
-                })
-        return results
+        teams = resp.json().get('response', [])
+        if teams:
+            print(f"API-Football team found: {teams[0]['team']['name']} (id={teams[0]['team']['id']})")
+            return teams[0]['team']['id']
     except Exception as e:
-        print(f"API-Football error: {e}")
-        return []
+        print(f"Football team ID error: {e}")
+    return None
 
-# ── API-Rugby ─────────────────────────────────────────────────────────────────
+def get_rugby_team_id(team_name):
+    """Look up API-Rugby team ID by name. Returns int or None."""
+    try:
+        resp = requests.get(
+            f'{RUGBY_BASE}/teams',
+            headers=HEADERS,
+            params={'search': team_name},
+            timeout=8
+        )
+        teams = resp.json().get('response', [])
+        if teams:
+            print(f"API-Rugby team found: {teams[0]['name']} (id={teams[0]['id']})")
+            return teams[0]['id']
+    except Exception as e:
+        print(f"Rugby team ID error: {e}")
+    return None
 
-def api_rugby_fixtures(team_name):
-    """Search today's rugby fixtures by team name."""
-    if not APISPORTS_KEY:
-        return []
+# ── Step 2: Get fixtures ───────────────────────────────────────────────────────
+
+def get_football_fixture(team_id, team_name):
+    """
+    Try today's fixture first, then next upcoming.
+    Returns fixture dict or None.
+    """
+    today = date.today().isoformat()
+    try:
+        # Try today
+        resp = requests.get(
+            f'{FOOTBALL_BASE}/fixtures',
+            headers=HEADERS,
+            params={'team': team_id, 'date': today, 'timezone': 'Europe/London'},
+            timeout=8
+        )
+        fixtures = resp.json().get('response', [])
+        if fixtures:
+            return _parse_football_fixture(fixtures[0], playing_today=True)
+
+        # Try next fixture
+        resp2 = requests.get(
+            f'{FOOTBALL_BASE}/fixtures',
+            headers=HEADERS,
+            params={'team': team_id, 'next': 1, 'timezone': 'Europe/London'},
+            timeout=8
+        )
+        fixtures2 = resp2.json().get('response', [])
+        if fixtures2:
+            return _parse_football_fixture(fixtures2[0], playing_today=False)
+
+    except Exception as e:
+        print(f"Football fixture error: {e}")
+    return None
+
+def _parse_football_fixture(item, playing_today):
+    teams   = item.get('teams', {})
+    fixture = item.get('fixture', {})
+    league  = item.get('league', {})
+    venue   = fixture.get('venue', {})
+    dt      = fixture.get('date', '')
+    home    = teams.get('home', {}).get('name', '')
+    away    = teams.get('away', {}).get('name', '')
+    return {
+        'fixture_id':   fixture.get('id'),
+        'home_team':    home,
+        'away_team':    away,
+        'competition':  league.get('name', ''),
+        'venue':        venue.get('name', '') if isinstance(venue, dict) else '',
+        'kickoff':      fmt_kickoff(dt),
+        'next_date':    fmt_date(dt),
+        'sport':        'football',
+        'playing_today': playing_today,
+    }
+
+def get_rugby_fixture(team_id, team_name):
+    """Try today then next upcoming rugby fixture."""
+    today = date.today().isoformat()
     try:
         resp = requests.get(
             f'{RUGBY_BASE}/games',
-            headers=APISPORTS_HEADERS,
-            params={'date': today_str(), 'timezone': 'Europe/London'},
+            headers=HEADERS,
+            params={'team': team_id, 'date': today, 'timezone': 'Europe/London'},
             timeout=8
         )
-        data = resp.json()
-        results = []
-        name_lower = team_name.lower()
-        for item in data.get('response', []):
-            teams = item.get('teams', {})
-            home  = teams.get('home', {}).get('name', '')
-            away  = teams.get('away', {}).get('name', '')
-            if name_lower in home.lower() or name_lower in away.lower():
-                league = item.get('league', {})
-                venue  = item.get('venue', {})
-                status = item.get('status', {})
-                dt     = item.get('date', '')
-                results.append({
-                    'fixture_id':  item.get('id'),
-                    'home_team':   home,
-                    'away_team':   away,
-                    'competition': league.get('name', ''),
-                    'venue':       venue.get('name', '') if isinstance(venue, dict) else '',
-                    'kickoff':     dt[11:16] if len(dt) > 11 else '',
-                    'sport':       'rugby',
-                    'playing_today': True,
-                })
-        # If not today, try upcoming
-        if not results:
-            resp2 = requests.get(
-                f'{RUGBY_BASE}/games',
-                headers=APISPORTS_HEADERS,
-                params={'team': team_name, 'next': 1, 'timezone': 'Europe/London'},
-                timeout=8
-            )
-            for item in resp2.json().get('response', []):
-                teams = item.get('teams', {})
-                home  = teams.get('home', {}).get('name', '')
-                away  = teams.get('away', {}).get('name', '')
-                league = item.get('league', {})
-                venue  = item.get('venue', {})
-                dt     = item.get('date', '')
-                next_date = 'Tomorrow' if dt[:10] == date.today().isoformat() else dt[:10]
-                results.append({
-                    'fixture_id':  item.get('id'),
-                    'home_team':   home,
-                    'away_team':   away,
-                    'competition': league.get('name', ''),
-                    'venue':       venue.get('name', '') if isinstance(venue, dict) else '',
-                    'kickoff':     dt[11:16] if len(dt) > 11 else '',
-                    'next_date':   next_date,
-                    'sport':       'rugby',
-                    'playing_today': False,
-                })
-        return results
-    except Exception as e:
-        print(f"API-Rugby error: {e}")
-        return []
+        games = resp.json().get('response', [])
+        if games:
+            return _parse_rugby_fixture(games[0], playing_today=True)
 
-# ── The Odds API ──────────────────────────────────────────────────────────────
+        # Next game
+        resp2 = requests.get(
+            f'{RUGBY_BASE}/games',
+            headers=HEADERS,
+            params={'team': team_id, 'next': 1, 'timezone': 'Europe/London'},
+            timeout=8
+        )
+        games2 = resp2.json().get('response', [])
+        if games2:
+            return _parse_rugby_fixture(games2[0], playing_today=False)
+
+    except Exception as e:
+        print(f"Rugby fixture error: {e}")
+    return None
+
+def _parse_rugby_fixture(item, playing_today):
+    teams  = item.get('teams', {})
+    league = item.get('league', {})
+    venue  = item.get('venue', {})
+    dt     = item.get('date', '')
+    home   = teams.get('home', {}).get('name', '')
+    away   = teams.get('away', {}).get('name', '')
+    return {
+        'fixture_id':   item.get('id'),
+        'home_team':    home,
+        'away_team':    away,
+        'competition':  league.get('name', ''),
+        'venue':        venue.get('name', '') if isinstance(venue, dict) else '',
+        'kickoff':      fmt_kickoff(dt),
+        'next_date':    fmt_date(dt),
+        'sport':        'rugby',
+        'playing_today': playing_today,
+    }
+
+# ── Odds ──────────────────────────────────────────────────────────────────────
+
+BK_PRIORITY = ['paddypower', 'williamhill', 'bet365', 'betfair', 'unibet']
+BK_NAMES    = {
+    'paddypower':  'Paddy Power',
+    'williamhill': 'William Hill',
+    'bet365':      'Bet365',
+    'betfair':     'Betfair',
+    'unibet':      'Unibet',
+}
+BK_URLS = {
+    'Paddy Power':  'https://www.paddypower.com',
+    'William Hill': 'https://www.williamhill.com',
+    'Bet365':       'https://www.bet365.com',
+    'Betfair':      'https://www.betfair.com',
+    'Unibet':       'https://www.unibet.co.uk',
+}
 
 def fetch_odds(home_team, away_team, sport):
-    """
-    Fetch odds from The Odds API for the given match.
-    Returns dict with home_odds, draw_odds, away_odds, bookmaker or None.
-    """
+    """Search The Odds API across all relevant sport keys."""
     if not ODDS_API_KEY:
         return None
     sport_keys = FOOTBALL_SPORT_KEYS if sport == 'football' else RUGBY_SPORT_KEYS
-    name_lower = home_team.lower()
 
     for sport_key in sport_keys:
         try:
             resp = requests.get(
                 f'{ODDS_BASE}/sports/{sport_key}/odds/',
                 params={
-                    'apiKey':  ODDS_API_KEY,
-                    'regions': 'uk',
-                    'markets': 'h2h',
+                    'apiKey':     ODDS_API_KEY,
+                    'regions':    'uk',
+                    'markets':    'h2h',
                     'oddsFormat': 'decimal',
                 },
                 timeout=8
             )
-            if resp.status_code == 422:
-                continue  # sport key not valid/active
+            if resp.status_code in (404, 422):
+                continue
             events = resp.json()
-            for event in (events if isinstance(events, list) else []):
+            if not isinstance(events, list):
+                continue
+
+            for event in events:
                 ht = (event.get('home_team') or '').lower()
                 at = (event.get('away_team') or '').lower()
-                if (name_lower in ht or ht in name_lower or
-                    name_lower in at or at in name_lower):
-                    # Found matching event - extract best UK bookmaker odds
-                    bookmakers_pref = ['paddypower', 'williamhill', 'bet365', 'betfair']
+                if name_matches(home_team, ht) or name_matches(home_team, at) or \
+                   name_matches(away_team, ht) or name_matches(away_team, at):
+
                     bookmakers = event.get('bookmakers', [])
                     chosen = None
-                    for pref in bookmakers_pref:
+                    for pref in BK_PRIORITY:
                         for bk in bookmakers:
                             if pref in bk.get('key', '').lower():
                                 chosen = bk
@@ -263,164 +298,168 @@ def fetch_odds(home_team, away_team, sport):
                             for o in market.get('outcomes', []):
                                 outcomes[o['name'].lower()] = o['price']
 
-                    # Map outcomes to home/draw/away
-                    home_price = outcomes.get(event.get('home_team','').lower())
-                    away_price = outcomes.get(event.get('away_team','').lower())
+                    home_price = outcomes.get(event.get('home_team', '').lower())
+                    away_price = outcomes.get(event.get('away_team', '').lower())
                     draw_price = outcomes.get('draw')
 
-                    bk_name_map = {
-                        'paddypower': 'Paddy Power',
-                        'williamhill': 'William Hill',
-                        'bet365': 'Bet365',
-                        'betfair': 'Betfair',
-                    }
                     bk_key  = chosen.get('key', '')
-                    bk_name = bk_name_map.get(bk_key, chosen.get('title', 'Paddy Power'))
-                    bk_url_map = {
-                        'Paddy Power':  'https://www.paddypower.com',
-                        'William Hill': 'https://www.williamhill.com',
-                        'Bet365':       'https://www.bet365.com',
-                        'Betfair':      'https://www.betfair.com',
-                    }
-
+                    bk_name = BK_NAMES.get(bk_key, chosen.get('title', 'Paddy Power'))
+                    print(f"Odds found via {bk_name} on {sport_key}")
                     return {
                         'home_odds':    decimal_to_fractional(home_price) if home_price else '',
                         'draw_odds':    decimal_to_fractional(draw_price) if draw_price else '',
                         'away_odds':    decimal_to_fractional(away_price) if away_price else '',
                         'bookmaker':    bk_name,
-                        'bookmaker_url': bk_url_map.get(bk_name, 'https://www.paddypower.com'),
+                        'bookmaker_url': BK_URLS.get(bk_name, 'https://www.paddypower.com'),
                     }
         except Exception as e:
             print(f"Odds API error ({sport_key}): {e}")
             continue
+    print(f"No odds found for {home_team} vs {away_team}")
     return None
 
-# ── WheresTheMatch scraper ────────────────────────────────────────────────────
+# ── WheresTheMatch TV scraper ─────────────────────────────────────────────────
 
 WTM_FOOTBALL = 'https://www.wheresthematch.com/live-football-on-tv/'
 WTM_RUGBY    = 'https://www.wheresthematch.com/live-rugby-union-on-tv/'
 
-def scrape_wheresthematch(team_name, sport):
+UK_CHANNELS = [
+    'Sky Sports Main Event', 'Sky Sports Football', 'Sky Sports Premier League',
+    'Sky Sports Action', 'Sky Sports Arena',
+    'Premier Sports 1', 'Premier Sports 2',
+    'TNT Sports 1', 'TNT Sports 2', 'TNT Sports 3', 'TNT Sports 4',
+    'BBC One', 'BBC Two', 'BBC Three', 'ITV', 'ITV4', 'Channel 4',
+    'Amazon Prime Video', 'DAZN', 'S4C', 'BBC Alba', 'TG4',
+    'Virgin Media Sport', 'FreeSports',
+]
+
+def scrape_tv_channel(team_name, sport):
     """
-    Try to scrape WheresTheMatch for TV channel info.
-    Returns tv_channel string or None if not found / JS-rendered.
+    Try to scrape WheresTheMatch for TV channel.
+    Returns channel string or None.
     """
     try:
         url = WTM_FOOTBALL if sport == 'football' else WTM_RUGBY
         resp = requests.get(url, timeout=10, headers={
-            'User-Agent': 'Mozilla/5.0 (compatible; BasilBot/1.0)'
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
         })
         if resp.status_code != 200:
+            print(f"WheresTheMatch returned {resp.status_code}")
             return None
         html = resp.text
-        # Look for team name near a channel name
         name_lower = team_name.lower()
-        # Find all text blocks containing the team name
         idx = html.lower().find(name_lower)
         if idx == -1:
+            print(f"WheresTheMatch: '{team_name}' not found in page")
             return None
-        # Extract surrounding 500 chars and look for channel names
-        snippet = html[max(0, idx-200):idx+500]
-        channels = [
-            'Sky Sports', 'Premier Sports', 'TNT Sports', 'BBC Two', 'ITV',
-            'Channel 4', 'S4C', 'BBC One', 'Amazon Prime', 'DAZN',
-            'BBC Alba', 'TG4', 'Virgin Media', 'FreeSports'
-        ]
-        for ch in channels:
+        # Look in surrounding 600 chars for channel names
+        snippet = html[max(0, idx-100):idx+600]
+        # Sort channels longest-first to match most specific first
+        for ch in sorted(UK_CHANNELS, key=len, reverse=True):
             if ch.lower() in snippet.lower():
+                print(f"WheresTheMatch: found channel '{ch}' for '{team_name}'")
                 return ch
+        print(f"WheresTheMatch: team found but no channel identified in snippet")
         return None
     except Exception as e:
         print(f"WheresTheMatch scrape error: {e}")
         return None
 
-# ── Fox fact generator (Claude, NO web search) ────────────────────────────────
+# ── Fox fact (Claude Haiku, NO web search) ────────────────────────────────────
 
 FOX_FACT_PROMPT = """\
-You are Basil - a dry, witty fox. Write a fox fact about this match.
+You are Basil - a dry, witty fox who knows sport. Write a fox fact about this match.
 
-Match: {home_team} vs {away_team}
-Competition: {competition}
-{odds_line}
+{home_team} vs {away_team} | {competition}{odds_section}
 
 Rules:
-- Must be genuinely surprising real fox behaviour (not made up)
-- Under 60 words
-- End with a dry, knowing one-liner connecting the fox behaviour to this match or its odds
+- Must describe real, verifiable fox behaviour (surprising or counterintuitive)
+- Under 60 words total
+- Final sentence must be a dry one-liner connecting the fox behaviour to this match or its odds
 - Never use exclamation marks
-- Tone: dry, precise, occasionally theatrical - never laddish
+- Tone: dry, economical, knowing - never laddish or pushy
 
-Return ONLY the fox fact text. Nothing else."""
+Return ONLY the fox fact. No preamble, no label, just the text."""
 
 def generate_fox_fact(match):
-    """Generate fox fact using Claude Sonnet WITHOUT web search. Very cheap."""
-    import anthropic as _anthropic
-    claude = _anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
-    odds_line = ''
+    """Generate fox fact using Claude Haiku WITHOUT web search. ~300 tokens."""
+    import anthropic as _ant
+    cl = _ant.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
+    odds_section = ''
     if match.get('home_odds'):
-        odds_line = f"Odds: {match['home_team']} {match['home_odds']} | Draw {match.get('draw_odds','')} | {match['away_team']} {match.get('away_odds','')}"
+        odds_section = (
+            f"\nOdds: {match['home_team']} {match['home_odds']} | "
+            f"Draw {match.get('draw_odds','')} | "
+            f"{match['away_team']} {match.get('away_odds','')}"
+        )
     prompt = FOX_FACT_PROMPT.format(
         home_team   = match.get('home_team', ''),
         away_team   = match.get('away_team', ''),
-        competition = match.get('competition', ''),
-        odds_line   = odds_line,
+        competition = match.get('competition', 'Unknown competition'),
+        odds_section= odds_section,
     )
     try:
-        resp = claude.messages.create(
-            model='claude-haiku-4-5-20251001',  # Haiku - even cheaper for this simple task
-            max_tokens=200,
+        resp = cl.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=150,
             messages=[{'role': 'user', 'content': prompt}]
         )
-        return (resp.content[0].text or '').strip()
+        fact = (resp.content[0].text or '').strip()
+        print(f"Fox fact generated ({len(fact)} chars)")
+        return fact
     except Exception as e:
         print(f"Fox fact error: {e}")
-        return "Foxes are one of the few wild animals known to play purely for fun. Worth remembering when you're studying the odds."
+        return ("Foxes cache food across hundreds of locations and remember each one. "
+                "Whether that instinct helps with today's result is another matter.")
 
 # ── Sport detector ────────────────────────────────────────────────────────────
 
+# Fast heuristics - no API call needed
+RUGBY_HINTS    = {'rugby', 'rfc', 'munster', 'leinster', 'ulster', 'connacht',
+                  'wasps', 'bath rugby', 'exeter', 'northampton saints', 'saracens',
+                  'harlequins', 'leicester tigers', 'toulon', 'clermont', 'la rochelle',
+                  'stormers', 'sharks', 'blues', 'crusaders', 'chiefs', 'highlanders',
+                  'brumbies', 'hurricanes', 'rebels', 'lions', 'reds', 'force',
+                  'edinburgh', 'glasgow warriors', 'dragons', 'scarlets', 'ospreys',
+                  'cardiff', 'zebre', 'benetton', 'bulls', 'cheetahs'}
+
+FOOTBALL_HINTS = {'fc', 'united', 'city', 'town', 'wanderers', 'rovers', 'athletic',
+                  'albion', 'arsenal', 'chelsea', 'liverpool', 'tottenham', 'spurs',
+                  'celtic', 'rangers', 'hibs', 'hibernian', 'hearts', 'dundee',
+                  'aberdeen', 'motherwell', 'kilmarnock', 'real madrid', 'barcelona',
+                  'juventus', 'psg', 'ajax', 'porto', 'milan', 'roma', 'napoli',
+                  'dortmund', 'lyon', 'marseille', 'atletico', 'villarreal',
+                  'york city', 'portsmouth', 'plymouth', 'coventry', 'bristol city',
+                  'sheffield', 'norwich', 'ipswich', 'sunderland', 'middlesbrough'}
+
 SPORT_DETECT_PROMPT = """\
-Classify this sports team query. Reply with exactly one word.
-
-Query: "{query}"
-
-football  - if this is clearly a football (soccer) team
-rugby     - if this is clearly a rugby union team
-both      - if it could be either sport (very rare)
-unknown   - if genuinely unclear
-
-One word only."""
+Classify: is "{query}" a football (soccer) team, a rugby union team, or unclear?
+Reply with exactly one word: football / rugby / unclear"""
 
 def detect_sport(query):
-    """Use Claude Haiku to detect sport. Returns 'football', 'rugby', 'both', 'unknown'."""
-    import anthropic as _anthropic
-    claude = _anthropic.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
-    # Fast heuristics first (no API call needed)
+    """Detect sport via heuristics then Claude Haiku if needed."""
     q = query.lower().strip()
-    rugby_hints    = ['rugby', 'rfc', 'munster', 'leinster', 'ulster', 'connacht',
-                      'wasps', 'bath rugby', 'exeter', 'northampton saints',
-                      'saracens', 'harlequins', 'leicester tigers', 'toulon',
-                      'clermont', 'la rochelle', 'stormers', 'sharks', 'blues',
-                      'crusaders', 'chiefs', 'highlanders', 'brumbies']
-    football_hints = ['fc', 'united', 'city', 'town', 'wanderers', 'rovers',
-                      'athletic', 'albion', 'arsenal', 'chelsea', 'liverpool',
-                      'celtic', 'rangers', 'hibs', 'hearts', 'dundee',
-                      'aberdeen', 'motherwell', 'kilmarnock', 'real madrid',
-                      'barcelona', 'juventus', 'psg', 'ajax', 'porto']
-    for hint in rugby_hints:
+    for hint in RUGBY_HINTS:
         if hint in q:
+            print(f"Sport detect (heuristic): rugby")
             return 'rugby'
-    for hint in football_hints:
+    for hint in FOOTBALL_HINTS:
         if hint in q:
+            print(f"Sport detect (heuristic): football")
             return 'football'
-    # Fall back to Haiku
+    # Haiku fallback
     try:
-        resp = claude.messages.create(
+        import anthropic as _ant
+        cl = _ant.Anthropic(api_key=os.environ.get('ANTHROPIC_API_KEY', ''))
+        resp = cl.messages.create(
             model='claude-haiku-4-5-20251001',
             max_tokens=5,
             messages=[{'role': 'user', 'content': SPORT_DETECT_PROMPT.format(query=query)}]
         )
         result = (resp.content[0].text or '').strip().lower().split()[0]
-        return result if result in ('football', 'rugby', 'both', 'unknown') else 'unknown'
+        result = result if result in ('football', 'rugby') else 'unknown'
+        print(f"Sport detect (Haiku): {result}")
+        return result
     except Exception as e:
         print(f"Sport detect error: {e}")
         return 'unknown'
@@ -429,54 +468,65 @@ def detect_sport(query):
 
 def get_match_data(team_name, sport=None):
     """
-    Full data fetch pipeline with fallbacks.
-    Returns a match dict compatible with fmt_team() or None on total failure.
+    Full pipeline with fallbacks at each step.
+    Returns match dict compatible with fmt_team(), or None if APIs return nothing.
+    None triggers Claude web search fallback in main.py.
     """
     if not sport or sport == 'unknown':
         sport = detect_sport(team_name)
-    if sport == 'both':
-        sport = 'rugby'  # default for ambiguous (Saints etc handled by disambiguation)
+
+    if sport == 'unknown':
+        print(f"Cannot determine sport for: {team_name}")
+        return None
 
     print(f"get_match_data: team={team_name}, sport={sport}")
 
-    # 1. Get fixture from API
-    fixtures = []
+    # Step 1: Get team ID
     if sport == 'football':
-        fixtures = api_football_fixtures(team_name)
+        team_id = get_football_team_id(team_name)
     else:
-        fixtures = api_rugby_fixtures(team_name)
+        team_id = get_rugby_team_id(team_name)
 
-    if not fixtures:
-        print(f"No fixtures from API for {team_name}")
-        return None  # Caller falls back to Claude web search
+    if not team_id:
+        print(f"No team ID found for: {team_name}")
+        return None
 
-    match = fixtures[0]
+    # Step 2: Get fixture
+    if sport == 'football':
+        match = get_football_fixture(team_id, team_name)
+    else:
+        match = get_rugby_fixture(team_id, team_name)
+
+    if not match:
+        print(f"No fixture found for: {team_name} (id={team_id})")
+        return None
+
+    print(f"Fixture: {match['home_team']} vs {match['away_team']} ({match['next_date']})")
 
     # Ensure searched team appears first
-    name_lower = team_name.lower()
-    if name_lower in match.get('away_team', '').lower() and \
-       name_lower not in match.get('home_team', '').lower():
+    if name_matches(team_name, match.get('away_team', '')) and \
+       not name_matches(team_name, match.get('home_team', '')):
         match['home_team'], match['away_team'] = match['away_team'], match['home_team']
-        # Mark as away so venue can be labelled correctly
         if match.get('venue'):
             match['venue'] = f"Away at {match['venue']}"
 
-    # 2. Get odds
+    # Step 3: Get odds
     odds = fetch_odds(match['home_team'], match['away_team'], sport)
     if odds:
         match.update(odds)
     else:
-        print(f"No odds found for {match['home_team']} vs {match['away_team']}")
         match.update({'home_odds': '', 'draw_odds': '', 'away_odds': '',
                       'bookmaker': '', 'bookmaker_url': ''})
 
-    # 3. TV channel from WheresTheMatch scrape
-    tv = scrape_wheresthematch(team_name, sport)
-    match['tv_channel']    = tv or ''
-    match['radio_station'] = ''
+    # Step 4: TV channel via scrape (only useful for today's matches)
+    tv = None
+    if match.get('playing_today'):
+        tv = scrape_tv_channel(team_name, sport)
+    match['tv_channel']     = tv or ''
+    match['radio_station']  = ''
     match['coverage_start'] = ''
 
-    # 4. Fox fact (Claude Haiku, no web search)
+    # Step 5: Fox fact via Claude Haiku (no web search)
     match['fox_fact'] = generate_fox_fact(match)
 
     return match
