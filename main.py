@@ -742,48 +742,35 @@ def webhook():
 
 # ── 9am pre-fetch ─────────────────────────────────────────────────────────────
 
-def prefetch_competition(competition, sport, today):
-    """One Claude call fetches all TV matches for a competition and caches each team."""
-    try:
-        prompt = COMPETITION_PREFETCH_PROMPT.format(
-            today=today, competition=competition, sport=sport
-        )
-        data = call_claude(prompt)
-        matches = data.get('matches', [])
-        if not matches:
-            print(f"No matches today: {competition}")
-            return
-        for match in matches:
-            match['playing_today'] = True
-            match['competition'] = competition
-            for team_field in ['home_team', 'away_team']:
-                team = (match.get(team_field) or '').strip()
-                if team:
-                    set_cache(team, match)
-                    print(f"  Cached: {team}")
-    except Exception as e:
-        print(f"Pre-fetch error ({competition}): {e}")
-
 def prefetch():
-    """Morning job: cache sport listings then all competition matches in parallel."""
+    """
+    Morning job: fetch today's fixtures for all tracked leagues via API.
+    Uses ~24 API calls total (not Claude web searches).
+    Falls back to Claude only for the sport overview listings.
+    """
     today = datetime.now().strftime('%A %d %B %Y')
     print(f"=== PRE-FETCH START: {today} ===")
 
-    # Sport listings first
+    # Sport overview listings (football / rugby keywords) - still uses Claude
+    # but only 2 calls, not 12
     for sport in ['football', 'rugby']:
         try:
             basil_sport(sport)
-            print(f"Cached {sport} listings")
+            print(f"Cached {sport} overview listing")
         except Exception as e:
-            print(f"Error caching {sport}: {e}")
-        time.sleep(3)
+            print(f"Error caching {sport} overview: {e}")
+        time.sleep(2)
 
-    # All competitions in parallel - max 2 at once to stay within rate limits
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        for competition, sport in PREFETCH_COMPETITIONS:
-            executor.submit(prefetch_competition, competition, sport, today)
-
-    print("=== PRE-FETCH COMPLETE ===")
+    # Batch fetch all league fixtures via API (no Claude web search)
+    try:
+        from data_layer import prefetch_all_leagues
+        all_matches = prefetch_all_leagues()
+        for team, match in all_matches.items():
+            set_cache(team, match)
+        print(f"=== PRE-FETCH COMPLETE: {len(all_matches)} teams cached ===")
+    except Exception as e:
+        print(f"Batch prefetch error: {e}")
+        alert_admin(f"Morning prefetch failed: {e}")
 
 scheduler = BackgroundScheduler(timezone='Europe/London')
 scheduler.add_job(prefetch, 'cron', hour=9, minute=0)
