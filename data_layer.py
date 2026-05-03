@@ -93,8 +93,77 @@ def name_matches(search, candidate):
 
 # ── Step 1: Get team ID ────────────────────────────────────────────────────────
 
+# ── Known team IDs (avoids /teams API call for common searches) ───────────────
+
+KNOWN_FOOTBALL_IDS = {
+    'arsenal': 42, 'chelsea': 49, 'liverpool': 40, 'everton': 45,
+    'manchester united': 33, 'man united': 33, 'man utd': 33,
+    'manchester city': 50, 'man city': 50,
+    'tottenham': 47, 'spurs': 47, 'tottenham hotspur': 47,
+    'newcastle': 34, 'newcastle united': 34,
+    'aston villa': 66, 'west ham': 48, 'wolves': 39, 'wolverhampton': 39,
+    'brighton': 51, 'brentford': 55, 'fulham': 36, 'crystal palace': 52,
+    'nottingham forest': 65, 'nottm forest': 65,
+    'bournemouth': 35, 'ipswich': 57, 'leicester': 46, 'leicester city': 46,
+    'southampton': 41,
+    'celtic': 232, 'rangers': 233, 'hearts': 250, 'hibernian': 248, 'hibs': 248,
+    'aberdeen': 246, 'dundee': 252, 'dundee united': 253,
+    'motherwell': 254, 'kilmarnock': 251, 'st mirren': 256,
+    'ross county': 255, 'livingston': 1359,
+    'atletico madrid': 530, 'atletico': 530, 'atleti': 530,
+    'real madrid': 541, 'barcelona': 529, 'sevilla': 536,
+    'villarreal': 533, 'valencia': 532,
+    'juventus': 496, 'inter milan': 505, 'inter': 505,
+    'ac milan': 489, 'milan': 489, 'roma': 497, 'napoli': 492,
+    'psg': 85, 'paris saint germain': 85,
+    'marseille': 81, 'lyon': 80, 'monaco': 91,
+    'ajax': 194, 'psv': 197, 'feyenoord': 195,
+    'porto': 212, 'benfica': 211,
+    'borussia dortmund': 165, 'dortmund': 165, 'bvb': 165,
+    'bayern munich': 157, 'bayern': 157,
+    'rb leipzig': 173, 'leipzig': 173,
+    'bayer leverkusen': 168, 'leverkusen': 168,
+}
+
+KNOWN_RUGBY_IDS = {
+    'leinster': 1, 'munster': 2, 'ulster': 3, 'connacht': 4,
+    'edinburgh': 5, 'glasgow warriors': 6, 'glasgow': 6,
+    'cardiff': 7, 'dragons': 8, 'scarlets': 9, 'ospreys': 10,
+    'stormers': 11, 'sharks': 12, 'bulls': 13, 'lions': 14,
+    'zebre': 16, 'benetton': 17,
+    'bath': 18, 'bath rugby': 18,
+    'bristol bears': 19, 'bristol': 19,
+    'exeter': 20, 'exeter chiefs': 20,
+    'gloucester': 21, 'harlequins': 22, 'quins': 22,
+    'leicester tigers': 23, 'tigers': 23,
+    'northampton': 25, 'northampton saints': 25,
+    'sale sharks': 26, 'sale': 26,
+    'saracens': 27, 'sarries': 27,
+    'toulon': 30, 'rc toulon': 30,
+    'la rochelle': 31, 'clermont': 32,
+    'toulouse': 33, 'stade toulousain': 33,
+    'bordeaux': 34, 'union bordeaux begles': 34,
+    'racing 92': 35, 'racing': 35,
+}
+
+def _lookup_known_id(team_name, sport):
+    key = team_name.lower().strip()
+    ids = KNOWN_FOOTBALL_IDS if sport == 'football' else KNOWN_RUGBY_IDS
+    if key in ids:
+        print(f"Known ID: {team_name} -> {ids[key]}")
+        return ids[key]
+    for known_name, team_id in ids.items():
+        if known_name in key or key in known_name:
+            print(f"Known ID (partial): {team_name} ~= {known_name} -> {team_id}")
+            return team_id
+    return None
+
 def get_football_team_id(team_name):
-    """Look up API-Football team ID by name. Tries multiple name variants."""
+    """Check known IDs first, then API search."""
+    known = _lookup_known_id(team_name, 'football')
+    if known:
+        return known
+    # API fallback for unknown teams
     variants = _name_variants(team_name)
     for name in variants:
         try:
@@ -109,14 +178,17 @@ def get_football_team_id(team_name):
             teams = data.get('response', [])
             if teams:
                 found = teams[0]['team']
-                print(f"API-Football team found: {found['name']} (id={found['id']})")
+                print(f"API team found: {found['name']} (id={found['id']})")
                 return found['id']
         except Exception as e:
-            print(f"Football team ID error (variant={name}): {e}")
+            print(f"Football team ID error ({name}): {e}")
     return None
 
 def get_rugby_team_id(team_name):
-    """Look up API-Rugby team ID by name. Tries multiple name variants."""
+    """Check known IDs first, then API search."""
+    known = _lookup_known_id(team_name, 'rugby')
+    if known:
+        return known
     variants = _name_variants(team_name)
     for name in variants:
         try:
@@ -131,10 +203,10 @@ def get_rugby_team_id(team_name):
             teams = data.get('response', [])
             if teams:
                 found = teams[0]
-                print(f"API-Rugby team found: {found.get('name','')} (id={found.get('id','')})")
+                print(f"API rugby team found: {found.get('name','')} (id={found.get('id','')})")
                 return found.get('id')
         except Exception as e:
-            print(f"Rugby team ID error (variant={name}): {e}")
+            print(f"Rugby team ID error ({name}): {e}")
     return None
 
 def _name_variants(name):
