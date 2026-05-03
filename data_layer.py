@@ -94,38 +94,68 @@ def name_matches(search, candidate):
 # ── Step 1: Get team ID ────────────────────────────────────────────────────────
 
 def get_football_team_id(team_name):
-    """Look up API-Football team ID by name. Returns int or None."""
-    try:
-        resp = requests.get(
-            f'{FOOTBALL_BASE}/teams',
-            headers=HEADERS,
-            params={'search': team_name},
-            timeout=8
-        )
-        teams = resp.json().get('response', [])
-        if teams:
-            print(f"API-Football team found: {teams[0]['team']['name']} (id={teams[0]['team']['id']})")
-            return teams[0]['team']['id']
-    except Exception as e:
-        print(f"Football team ID error: {e}")
+    """Look up API-Football team ID by name. Tries multiple name variants."""
+    variants = _name_variants(team_name)
+    for name in variants:
+        try:
+            resp = requests.get(
+                f'{FOOTBALL_BASE}/teams',
+                headers=HEADERS,
+                params={'search': name},
+                timeout=8
+            )
+            data = resp.json()
+            print(f"API-Football /teams?search={name}: status={resp.status_code}, results={data.get('results',0)}")
+            teams = data.get('response', [])
+            if teams:
+                found = teams[0]['team']
+                print(f"API-Football team found: {found['name']} (id={found['id']})")
+                return found['id']
+        except Exception as e:
+            print(f"Football team ID error (variant={name}): {e}")
     return None
 
 def get_rugby_team_id(team_name):
-    """Look up API-Rugby team ID by name. Returns int or None."""
-    try:
-        resp = requests.get(
-            f'{RUGBY_BASE}/teams',
-            headers=HEADERS,
-            params={'search': team_name},
-            timeout=8
-        )
-        teams = resp.json().get('response', [])
-        if teams:
-            print(f"API-Rugby team found: {teams[0]['name']} (id={teams[0]['id']})")
-            return teams[0]['id']
-    except Exception as e:
-        print(f"Rugby team ID error: {e}")
+    """Look up API-Rugby team ID by name. Tries multiple name variants."""
+    variants = _name_variants(team_name)
+    for name in variants:
+        try:
+            resp = requests.get(
+                f'{RUGBY_BASE}/teams',
+                headers=HEADERS,
+                params={'search': name},
+                timeout=8
+            )
+            data = resp.json()
+            print(f"API-Rugby /teams?search={name}: status={resp.status_code}, results={data.get('results',0)}")
+            teams = data.get('response', [])
+            if teams:
+                found = teams[0]
+                print(f"API-Rugby team found: {found.get('name','')} (id={found.get('id','')})")
+                return found.get('id')
+        except Exception as e:
+            print(f"Rugby team ID error (variant={name}): {e}")
     return None
+
+def _name_variants(name):
+    """Generate search variants for a team name."""
+    import unicodedata
+    variants = [name]
+    # Strip accents: Atlético -> Atletico
+    normalized = unicodedata.normalize('NFD', name)
+    stripped = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
+    if stripped != name:
+        variants.append(stripped)
+    # First word only (e.g. "Leinster Rugby" -> "Leinster")
+    first_word = name.split()[0]
+    if first_word not in variants and len(first_word) > 3:
+        variants.append(first_word)
+    # Without common suffixes
+    for suffix in [' FC', ' RFC', ' City', ' United', ' Town', ' Rugby']:
+        clean = name.replace(suffix, '').strip()
+        if clean not in variants and clean != name:
+            variants.append(clean)
+    return variants
 
 # ── Step 2: Get fixtures ───────────────────────────────────────────────────────
 
@@ -530,3 +560,111 @@ def get_match_data(team_name, sport=None):
     match['fox_fact'] = generate_fox_fact(match)
 
     return match
+
+# ── Batch league fetch (for 9am prefetch - avoids Claude web search) ──────────
+
+# API-Football league IDs
+FOOTBALL_LEAGUE_IDS = {
+    'Premier League':       39,
+    'Scottish Premiership': 179,
+    'Scottish FA Cup':      195,
+    'Champions League':     2,
+    'Europa League':        3,
+}
+
+# API-Rugby league IDs (common ones - check dashboard if unsure)
+RUGBY_LEAGUE_IDS = {
+    'Gallagher Premiership': 1,
+    'URC':                   2,
+    'Champions Cup':         3,
+    'Challenge Cup':         4,
+    'Six Nations':           5,
+    'Super Rugby':           6,
+}
+
+def fetch_league_fixtures_today(league_id, sport):
+    """
+    Get all fixtures for a league today in one API call.
+    Returns list of match dicts, each ready to cache by team name.
+    Much more efficient than per-team lookups for the prefetch.
+    """
+    today = date.today().isoformat()
+    base  = FOOTBALL_BASE if sport == 'football' else RUGBY_BASE
+    endpoint = '/fixtures' if sport == 'football' else '/games'
+    param_key = 'league' if sport == 'football' else 'league'
+
+    try:
+        resp = requests.get(
+            f'{base}{endpoint}',
+            headers=HEADERS,
+            params={'date': today, param_key: league_id, 'timezone': 'Europe/London'},
+            timeout=10
+        )
+        data = resp.json()
+        items = data.get('response', [])
+        print(f"League {league_id} ({sport}): {len(items)} fixtures today")
+        matches = []
+        for item in items:
+            if sport == 'football':
+                match = _parse_football_fixture(item, playing_today=True)
+            else:
+                match = _parse_rugby_fixture(item, playing_today=True)
+            if match:
+                match['competition'] = match.get('competition', '')
+                matches.append(match)
+        return matches
+    except Exception as e:
+        print(f"League fetch error (league={league_id}, sport={sport}): {e}")
+        return []
+
+def prefetch_all_leagues():
+    """
+    Fetch today's fixtures for all tracked leagues using batch API calls.
+    Returns dict of team_name -> match_data for caching.
+    Uses ~24 API calls total (well within 100/day free limit for normal days).
+    On days with no matches (e.g. international break) uses very few calls.
+    """
+    all_matches = {}
+
+    for league_name, league_id in FOOTBALL_LEAGUE_IDS.items():
+        fixtures = fetch_league_fixtures_today(league_id, 'football')
+        for match in fixtures:
+            # Get odds for each fixture
+            odds = fetch_odds(match['home_team'], match['away_team'], 'football')
+            if odds:
+                match.update(odds)
+            else:
+                match.update({'home_odds': '', 'draw_odds': '', 'away_odds': '',
+                             'bookmaker': '', 'bookmaker_url': ''})
+            match['tv_channel']     = ''
+            match['radio_station']  = ''
+            match['coverage_start'] = ''
+            match['fox_fact']       = generate_fox_fact(match)
+            # Cache both teams
+            for team_key in ['home_team', 'away_team']:
+                team = match.get(team_key, '').strip()
+                if team:
+                    all_matches[team] = match
+        time.sleep(1)  # Be polite to the API
+
+    for league_name, league_id in RUGBY_LEAGUE_IDS.items():
+        fixtures = fetch_league_fixtures_today(league_id, 'rugby')
+        for match in fixtures:
+            odds = fetch_odds(match['home_team'], match['away_team'], 'rugby')
+            if odds:
+                match.update(odds)
+            else:
+                match.update({'home_odds': '', 'draw_odds': '', 'away_odds': '',
+                             'bookmaker': '', 'bookmaker_url': ''})
+            match['tv_channel']     = ''
+            match['radio_station']  = ''
+            match['coverage_start'] = ''
+            match['fox_fact']       = generate_fox_fact(match)
+            for team_key in ['home_team', 'away_team']:
+                team = match.get(team_key, '').strip()
+                if team:
+                    all_matches[team] = match
+        time.sleep(1)
+
+    print(f"Prefetch complete: {len(all_matches)} teams cached")
+    return all_matches
