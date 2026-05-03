@@ -413,10 +413,6 @@ def fmt_team(d, body=''):
         lines += [
             "🦊 *Basil says:*",
             d.get('fox_fact', ''),
-            '',
-            "📲 *Want a flutter?*",
-            url,
-            GAMBLING_REMINDER,
         ]
     else:
         searched = d.get('home_team', body)
@@ -444,14 +440,10 @@ def fmt_team(d, body=''):
             d.get('fox_fact', ''),
         ]
         if d.get('home_odds') and d.get('home_odds') not in ('', 'Unknown'):
-            url = make_bet_url(d.get('bookmaker_url', ''), d.get('bookmaker', 'Paddy Power'))
             lines += [
                 '',
                 f"💰 *Early odds ({d.get('bookmaker', 'Paddy Power')})*",
                 f"{d.get('home_team','?')}: {d['home_odds']} | Draw: {d.get('draw_odds','')} | {d.get('away_team','?')}: {d.get('away_odds','')}\n",
-                "📲 *Want a flutter?*",
-                url,
-                GAMBLING_REMINDER,
             ]
     return '\n'.join(lines)
 
@@ -462,7 +454,7 @@ def fmt_sport(d):
     for m in d.get('matches', []):
         lines.append(f"{e} *{m['home_team']} vs {m['away_team']}*")
         lines.append(f"{m['competition']} - {m['tv_channel']}, KO {m['kickoff']}\n")
-    lines += ["🦊 *Basil says:*", d.get('fox_fact', ''), '', "📲 *Have a flutter:*", url, GAMBLING_REMINDER]
+    lines += ["🦊 *Basil says:*", d.get('fox_fact', '')]
     return '\n'.join(lines)
 
 def fmt_ambiguous(options, original):
@@ -925,4 +917,3 @@ function show(id, tab) {
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
