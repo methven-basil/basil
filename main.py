@@ -751,9 +751,12 @@ def prefetch():
     #     alert_admin(f"Morning prefetch failed: {e}")
     print("=== PRE-FETCH COMPLETE: API batch disabled (API-Football suspended) ===")
 
-scheduler = BackgroundScheduler(timezone='Europe/London')
-scheduler.add_job(prefetch, 'cron', hour=9, minute=0)
-scheduler.start()
+# Morning pre-fetch disabled — Claude web search runs on demand only.
+# Re-enable these three lines (and restore API-Football in data_layer.py)
+# when the sports data API is back and pre-fetching is cost-effective again.
+# scheduler = BackgroundScheduler(timezone='Europe/London')
+# scheduler.add_job(prefetch, 'cron', hour=9, minute=0)
+# scheduler.start()
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
 
