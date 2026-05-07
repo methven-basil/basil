@@ -8,7 +8,7 @@ import threading
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from functools import wraps
 
 from flask import (Flask, request, Response,
@@ -825,17 +825,27 @@ def admin_logout():
 @auth_required
 def admin():
     users   = db.table('users').select('*').order('registered_at', desc=True).execute().data
-    queries = db.table('queries').select('*').order('queried_at', desc=True).limit(100).execute().data
+    queries = db.table('queries').select('*').order('queried_at', desc=True).execute().data
     codes   = db.table('invite_codes').select('*').order('created_at', desc=True).execute().data
-    today_count = sum(1 for q in queries if q['queried_at'][:10] == date.today().isoformat())
-    code_names  = {c['code']: (c.get('note') or '').strip() for c in codes}
-    phone_names = {u['phone_number']: code_names.get(u['invite_code'], '') for u in users}
+    today_count    = sum(1 for q in queries if q['queried_at'][:10] == date.today().isoformat())
+    code_names     = {c['code']: (c.get('note') or '').strip() for c in codes}
+    phone_names    = {u['phone_number']: code_names.get(u['invite_code'], '') for u in users}
+    seven_days_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    phone_query_counts = {}
+    for q in queries:
+        p = q['phone_number']
+        if p not in phone_query_counts:
+            phone_query_counts[p] = {'total': 0, 'last7': 0}
+        phone_query_counts[p]['total'] += 1
+        if q['queried_at'] >= seven_days_ago:
+            phone_query_counts[p]['last7'] += 1
     return render_template_string(ADMIN_HTML,
         users=users, queries=queries, codes=codes,
         today_count=today_count,
         total_users=len(users),
         total_queries=len(queries),
-        phone_names=phone_names
+        phone_names=phone_names,
+        phone_query_counts=phone_query_counts
     )
 
 @app.route('/admin/block', methods=['POST'])
@@ -985,13 +995,35 @@ ADMIN_HTML = '''<!doctype html>
 </div>
 <div id="users" class="panel active">
   <table>
-    <thead><tr><th>Phone</th><th>Code</th><th>Registered</th><th>Status</th><th></th></tr></thead>
+    <thead>
+      <tr>
+        <th rowspan="2">Who</th>
+        <th rowspan="2">Code</th>
+        <th rowspan="2">Registered</th>
+        <th colspan="2" style="text-align:center;border-bottom:1px solid #e0d9cf">Queries</th>
+        <th rowspan="2">Status</th>
+        <th rowspan="2"></th>
+      </tr>
+      <tr>
+        <th>7 days</th>
+        <th>All time</th>
+      </tr>
+    </thead>
     <tbody>
     {% for u in users %}
     <tr>
-      <td>{{ u.phone_number }}</td>
+      <td>
+        {% if phone_names.get(u.phone_number) %}
+          <span style="font-weight:600">{{ phone_names[u.phone_number] }}</span>
+          <div class="muted">{{ u.phone_number }}</div>
+        {% else %}
+          {{ u.phone_number }}
+        {% endif %}
+      </td>
       <td><span class="badge code-badge">{{ u.invite_code }}</span></td>
       <td>{{ u.registered_at[:16].replace("T"," ") }}</td>
+      <td style="text-align:center">{{ phone_query_counts.get(u.phone_number, {}).get('last7', 0) }}</td>
+      <td style="text-align:center">{{ phone_query_counts.get(u.phone_number, {}).get('total', 0) }}</td>
       <td>{% if u.blocked %}<span class="badge blocked">Blocked</span>{% else %}<span class="badge ok">Active</span>{% endif %}</td>
       <td>
         {% if u.blocked %}
@@ -1008,17 +1040,32 @@ ADMIN_HTML = '''<!doctype html>
       </td>
     </tr>
     {% else %}
-    <tr><td colspan="5" style="text-align:center;color:#aaa;padding:2rem">No users yet</td></tr>
+    <tr><td colspan="7" style="text-align:center;color:#aaa;padding:2rem">No users yet</td></tr>
     {% endfor %}
     </tbody>
   </table>
 </div>
 <div id="queries" class="panel">
   <table>
-    <thead><tr><th>Time</th><th>Who</th><th>Query</th><th>Response preview</th></tr></thead>
+    <thead><tr>
+      <th>Time</th>
+      <th>
+        Who
+        <select id="nameFilter" onchange="filterQueries()" style="margin-left:.5rem;font-size:.75rem;padding:.2rem .4rem;border:1px solid #ddd;border-radius:4px;color:#555">
+          <option value="">All</option>
+          {% for phone, name in phone_names.items() %}
+            {% if name %}
+              <option value="{{ phone }}">{{ name }}</option>
+            {% endif %}
+          {% endfor %}
+        </select>
+      </th>
+      <th>Query</th>
+      <th>Response preview</th>
+    </tr></thead>
     <tbody>
     {% for q in queries %}
-    <tr>
+    <tr data-phone="{{ q.phone_number }}">
       <td style="white-space:nowrap">{{ q.queried_at[:16].replace("T"," ") }}</td>
       <td>
         {% if phone_names.get(q.phone_number) %}
@@ -1083,6 +1130,12 @@ function show(id, tab) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   tab.classList.add('active');
+}
+function filterQueries() {
+  const val = document.getElementById('nameFilter').value;
+  document.querySelectorAll('#queries tbody tr[data-phone]').forEach(row => {
+    row.style.display = (!val || row.dataset.phone === val) ? '' : 'none';
+  });
 }
 </script>
 </body>
