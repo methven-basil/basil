@@ -699,6 +699,8 @@ def webhook():
             else:
                 register_user(phone, code)
                 increment_invite_code(code)
+                name = (invite.get('note') or '').strip() or 'Unknown'
+                alert_admin(f"New user registered: {name} ({phone})")
                 send(from_wa,
                      "🦊 *Welcome to Basil!*\n\n"
                      "Send me any team name and I'll tell you what channel they're on, "
