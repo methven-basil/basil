@@ -92,15 +92,23 @@ def get_today_count(phone):
 
 # ── Cache helpers ─────────────────────────────────────────────────────────────
 
+CACHE_TTL_HOURS = 12
+
 def cache_key(query):
-    return f"{date.today().isoformat()}:{query.lower().strip()}"
+    return query.lower().strip()
 
 def get_cache(query):
     try:
-        r = db.table('cache').select('data').eq('cache_key', cache_key(query)).execute()
+        r = db.table('cache').select('data,cached_at').eq('cache_key', cache_key(query)).execute()
         if r.data:
-            print(f"Cache hit: {query}")
-            return json.loads(r.data[0]['data'])
+            row = r.data[0]
+            cached_at = datetime.fromisoformat(row['cached_at'])
+            age_hours = (datetime.utcnow() - cached_at).total_seconds() / 3600
+            if age_hours < CACHE_TTL_HOURS:
+                print(f"Cache hit ({age_hours:.1f}h old): {query}")
+                return json.loads(row['data'])
+            else:
+                print(f"Cache stale ({age_hours:.1f}h old): {query}")
     except Exception as e:
         print(f"Cache read error: {e}")
     return None
@@ -331,6 +339,36 @@ def call_claude(prompt):
 
     raise ValueError("Could not extract valid JSON after 2 attempts")
 
+# ── Fox fact regeneration (cache hits) ───────────────────────────────────────
+
+FOX_FACT_PROMPT = """\
+Write a fox fact for this sports match: {home_team} vs {away_team} ({competition}).
+Real fox behaviour only, under 60 words, ends with a dry one-liner connecting fox instinct \
+to having a wager on this match.
+Reply with ONLY the fox fact text — no JSON, no preamble."""
+
+def regenerate_fox_fact(cached_result):
+    """Fresh fox fact for a cache hit. Haiku only — no web search, fraction of a penny."""
+    try:
+        home = cached_result.get('home_team', '')
+        away = cached_result.get('away_team', '')
+        comp = cached_result.get('competition', '')
+        resp = claude.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=150,
+            messages=[{'role': 'user', 'content': FOX_FACT_PROMPT.format(
+                home_team=home, away_team=away, competition=comp
+            )}]
+        )
+        fact = (resp.content[0].text or '').strip()
+        if fact:
+            cached_result = dict(cached_result)
+            cached_result['fox_fact'] = fact
+            print(f"Fox fact regenerated for {home} vs {away}")
+    except Exception as e:
+        print(f"Fox fact regeneration error: {e}")
+    return cached_result
+
 def basil_team(query):
     """
     Claude web search is the primary path.
@@ -339,7 +377,7 @@ def basil_team(query):
     """
     cached = get_cache(query)
     if cached:
-        return cached
+        return regenerate_fox_fact(cached)
 
     # Primary: Claude web search
     print(f"Claude web search for: {query}")
@@ -790,11 +828,14 @@ def admin():
     queries = db.table('queries').select('*').order('queried_at', desc=True).limit(100).execute().data
     codes   = db.table('invite_codes').select('*').order('created_at', desc=True).execute().data
     today_count = sum(1 for q in queries if q['queried_at'][:10] == date.today().isoformat())
+    code_names  = {c['code']: (c.get('note') or '').strip() for c in codes}
+    phone_names = {u['phone_number']: code_names.get(u['invite_code'], '') for u in users}
     return render_template_string(ADMIN_HTML,
         users=users, queries=queries, codes=codes,
         today_count=today_count,
         total_users=len(users),
-        total_queries=len(queries)
+        total_queries=len(queries),
+        phone_names=phone_names
     )
 
 @app.route('/admin/block', methods=['POST'])
@@ -974,12 +1015,19 @@ ADMIN_HTML = '''<!doctype html>
 </div>
 <div id="queries" class="panel">
   <table>
-    <thead><tr><th>Time</th><th>Phone</th><th>Query</th><th>Response preview</th></tr></thead>
+    <thead><tr><th>Time</th><th>Who</th><th>Query</th><th>Response preview</th></tr></thead>
     <tbody>
     {% for q in queries %}
     <tr>
       <td style="white-space:nowrap">{{ q.queried_at[:16].replace("T"," ") }}</td>
-      <td>{{ q.phone_number }}</td>
+      <td>
+        {% if phone_names.get(q.phone_number) %}
+          <span style="font-weight:600">{{ phone_names[q.phone_number] }}</span>
+          <div class="muted">{{ q.phone_number }}</div>
+        {% else %}
+          {{ q.phone_number }}
+        {% endif %}
+      </td>
       <td class="trunc">{{ q.query }}</td>
       <td class="trunc muted">{{ q.response }}</td>
     </tr>
